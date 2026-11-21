@@ -1,15 +1,20 @@
 /**
- * YGO Remote Lens - Step 1.7 Precision Enhanced Prototype
- * - 『オルフェゴール・ディヴェル』等の暗色・単色系イラストが認識されにくい問題を解決：
- *   1) チャンネル別正規化で単色系（赤茶色など）の固有色味が消えていたのを修正し、「固有カラー特徴」「照明正規化コントラスト」「8x8ブロック明暗シルエット」「エッジ勾配」の4種統合特徴ベクトルに刷新
- *   2) 40枚の画像を同時リクエストして一部がタイムアウト落ちするのを防ぐため、6枚ずつのバッチ並列＋リトライ取得に変更（40枚すべて確実に実画像化）
- *   3) Camo Camera 等の外部カメラを画面上で直接選べるカメラ選択プルダウン対応
+ * YGO Remote Lens - Step 2 Browser AI Recognition Edition
+ *
+ * 従来の16×16自作ピクセル比較を廃止し、ブラウザ内AIモデル（DINOv2-small / MobileNet v2）による
+ * 高精度な深層特徴ベクトル検索へ完全移行:
+ *   1) Transformers.js (Xenova/dinov2-small) および TensorFlow.js (MobileNet v2) のデュアルAI対応
+ *   2) 暗色系カード（オルフェゴール・ディヴェル等）やスリーブの光反射に強い適応的コントラスト＆ガンマ補正
+ *   3) クリック瞬間のフレームをオフスクリーンCanvasへスナップショットしてから非同期AI解析（カメラ映像ブレ防止）
+ *   4) IndexedDB によるカードDB特徴ベクトルの永続キャッシュ（2回目以降の起動を大幅高速化）
+ *   5) ビルド不要・GitHub Pages でそのまま動作
  */
 
-const FEATURE_GRID_SIZE = 16;
+const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 class YgoRemoteLensApp {
   constructor() {
+    this.aiEngine = new window.YgoAIEngine();
     this.cardsDB = [];
     this.history = [];
     this.mode = 'demo'; // 'demo' | 'video' | 'image'
@@ -19,10 +24,13 @@ class YgoRemoteLensApp {
     this.demoBoardCards = [];
 
     this.isDragging = false;
+    this.isRecognizing = false;
+    this.isSwitchingEngine = false;
     this.dragStart = { x: 0, y: 0 };
     this.dragCurrent = { x: 0, y: 0 };
     this.lastSelectionBox = null;
     this.bestMatchedSubBox = null;
+    this.lastClickWasDemoCard = false;
 
     this.initElements();
     this.bindEvents();
@@ -38,6 +46,8 @@ class YgoRemoteLensApp {
     this.cropPreviewCtx = this.cropPreviewCanvas.getContext('2d');
 
     this.dbStatusBadge = document.getElementById('dbStatusBadge');
+    this.aiEngineSelect = document.getElementById('aiEngineSelect');
+    this.enhanceLightingCheck = document.getElementById('enhanceLightingCheck');
     this.cropSizeSelect = document.getElementById('cropSizeSelect');
     this.cameraDeviceSelect = document.getElementById('cameraDeviceSelect');
     this.matchStatusText = document.getElementById('matchStatusText');
@@ -49,6 +59,7 @@ class YgoRemoteLensApp {
     this.historyCount = document.getElementById('historyCount');
     this.dbCardList = document.getElementById('dbCardList');
     this.dbCount = document.getElementById('dbCount');
+    this.btnClearAiCache = document.getElementById('btnClearAiCache');
   }
 
   bindEvents() {
@@ -61,6 +72,26 @@ class YgoRemoteLensApp {
       this.cameraDeviceSelect.addEventListener('change', () => {
         if (this.mode === 'video' && this.videoStream) {
           this.startCamera();
+        }
+      });
+    }
+
+    if (this.aiEngineSelect) {
+      this.aiEngineSelect.addEventListener('change', async () => {
+        const selected = this.aiEngineSelect.value;
+        await this.switchAIEngine(selected);
+      });
+    }
+
+    if (this.btnClearAiCache) {
+      this.btnClearAiCache.addEventListener('click', async () => {
+        if (this.isSwitchingEngine || this.isRecognizing) return;
+        this.btnClearAiCache.disabled = true;
+        try {
+          await this.aiEngine.clearCache();
+          await this.rebuildAllCardEmbeddings(true);
+        } finally {
+          this.btnClearAiCache.disabled = false;
         }
       });
     }
@@ -98,7 +129,6 @@ class YgoRemoteLensApp {
         const opt = document.createElement('option');
         opt.value = dev.deviceId;
         opt.textContent = dev.label || `カメラ ${idx + 1}`;
-        // Camo があれば優先選択しやすいようにマーク
         if (/camo|iriun|iphone/i.test(opt.textContent) && !currentVal) {
           opt.selected = true;
         } else if (dev.deviceId === currentVal) {
@@ -111,23 +141,32 @@ class YgoRemoteLensApp {
     }
   }
 
+  setStatusBadge(text, isLoading = false) {
+    this.dbStatusBadge.textContent = text;
+    if (isLoading) {
+      this.dbStatusBadge.classList.add('loading');
+    } else {
+      this.dbStatusBadge.classList.remove('loading');
+    }
+  }
+
   /**
-   * 初期カードデータベースの読み込み（バッチ制御により全40枚を通信落ちなく確実に取得）
+   * 初期カードデータベースとAIエンジンの並列初期化
    */
   async initDatabase() {
     const initialCards = window.INITIAL_CARDS_DATA || [];
 
     this.cardsDB = initialCards.map((card) => {
       const fallbackCanvas = this.createFallbackCardArt(card);
-      const feature = this.extractFeatureFromImage(fallbackCanvas, 0);
       return {
         ...card,
         safeCanvasElement: fallbackCanvas,
         thumbUrl: card.image_crop,
-        feature,
-        centerFeature: feature,
-        tightFeature: feature,
-        isFallback: true
+        feature: null,
+        centerFeature: null,
+        tightFeature: null,
+        isFallback: true,
+        aiIndexed: false
       };
     });
 
@@ -135,36 +174,187 @@ class YgoRemoteLensApp {
     this.startDemoBoard();
     this.startRenderLoop();
 
+    this.setStatusBadge('🤖 AIモデル＆カード画像を取得中...', true);
+    if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
+
+    const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'dinov2';
+
+    // AIモデル読み込みとカード実画像取得を並列で進める
+    let aiProgressText = 'AIモデル初期化中...';
+    let imgProgressText = `画像(0/${initialCards.length})`;
+    const updateCombinedStatus = () => {
+      this.setStatusBadge(`⏳ ${aiProgressText} | ${imgProgressText}`, true);
+    };
+
+    const aiInitPromise = this.aiEngine.init(preferredEngine, (msg) => {
+      aiProgressText = msg;
+      updateCombinedStatus();
+    });
+
+    const imageLoadPromise = this.fetchAllCardImages((loaded, total, realCount) => {
+      imgProgressText = `画像(${loaded}/${total}・成功${realCount})`;
+      updateCombinedStatus();
+    });
+
+    const [actualEngine] = await Promise.all([aiInitPromise, imageLoadPromise]);
+
+    // フォールバックが発生した場合はプルダウン表示も同期
+    if (this.aiEngineSelect) {
+      if (actualEngine === 'dinov2' || actualEngine === 'mobilenet') {
+        this.aiEngineSelect.value = actualEngine;
+      }
+      this.aiEngineSelect.disabled = false;
+    }
+
+    // 全カードのAI特徴ベクトルを構築（IndexedDBキャッシュがあれば即座に完了）
+    await this.rebuildAllCardEmbeddings(false);
+
+    this.matchStatusText.textContent = '盤面のカードをクリックまたはドラッグで選択してください';
+  }
+
+  /**
+   * 6枚ずつのバッチ並列＋リトライで全カードの実画像を取得
+   */
+  async fetchAllCardImages(onProgress) {
     let loadedCount = 0;
     let realImageCount = 0;
-    this.dbStatusBadge.textContent = `実カード画像を取得中 (0/${initialCards.length})...`;
-    this.dbStatusBadge.classList.add('loading');
+    const total = this.cardsDB.length;
 
-    // 一気に40枚リクエストするとプロキシ側でレート制限・タイムアウトが起きるため、6枚ずつ順番に確実に取得
     const BATCH_SIZE = 6;
-    for (let i = 0; i < this.cardsDB.length; i += BATCH_SIZE) {
+    for (let i = 0; i < total; i += BATCH_SIZE) {
       const batch = this.cardsDB.slice(i, i + BATCH_SIZE);
       await Promise.all(
         batch.map(async (cardEntry) => {
-          const ok = await this.upgradeCardWithRealImage(cardEntry);
+          const ok = await this.loadRealImageForCard(cardEntry);
           loadedCount++;
           if (ok) realImageCount++;
-          this.dbStatusBadge.textContent = `画像読込中 (${loadedCount}/${initialCards.length} / 成功:${realImageCount})...`;
+          onProgress(loadedCount, total, realImageCount);
         })
       );
       this.renderDBList();
     }
 
-    // もし1回目のバッチでタイムアウトしたカードがあればもう1度だけリトライ
+    // 失敗分を1回リトライ
     const failedEntries = this.cardsDB.filter((c) => c.isFallback);
     for (const cardEntry of failedEntries) {
-      const ok = await this.upgradeCardWithRealImage(cardEntry);
-      if (ok) realImageCount++;
+      const ok = await this.loadRealImageForCard(cardEntry);
+      if (ok) {
+        realImageCount++;
+        onProgress(loadedCount, total, realImageCount);
+      }
     }
 
-    this.dbStatusBadge.textContent = `✅ 認識エンジン稼働中 (${this.cardsDB.length}枚 / 実画像:${realImageCount}枚)`;
-    this.dbStatusBadge.classList.remove('loading');
     this.renderDBList();
+    return realImageCount;
+  }
+
+  async loadRealImageForCard(cardEntry) {
+    try {
+      const safeCanvas = await this.fetchImageAsSafeCanvas(cardEntry.image_crop);
+      cardEntry.safeCanvasElement = safeCanvas;
+      cardEntry.isFallback = false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 現在のAIエンジンで全カードの特徴ベクトルを構築（IndexedDBキャッシュ優先）
+   */
+  async rebuildAllCardEmbeddings(forceRecompute = false) {
+    this.isSwitchingEngine = true;
+    if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
+
+    const total = this.cardsDB.length;
+    let cacheHits = 0;
+    let realCount = 0;
+    const engineLabel = this.aiEngine.getEngineLabel();
+
+    for (let i = 0; i < total; i++) {
+      const cardEntry = this.cardsDB[i];
+      if (!cardEntry.isFallback) realCount++;
+
+      try {
+        if (forceRecompute || cardEntry.isFallback) {
+          const W = cardEntry.safeCanvasElement.width;
+          const H = cardEntry.safeCanvasElement.height;
+          cardEntry.feature = await this.aiEngine.extractEmbedding(cardEntry.safeCanvasElement, 0, null, true);
+          cardEntry.centerFeature = await this.aiEngine.extractEmbedding(
+            cardEntry.safeCanvasElement,
+            0,
+            { x: W * 0.08, y: H * 0.08, w: W * 0.84, h: H * 0.84 },
+            true
+          );
+          cardEntry.tightFeature = await this.aiEngine.extractEmbedding(
+            cardEntry.safeCanvasElement,
+            0,
+            { x: W * 0.15, y: H * 0.15, w: W * 0.70, h: H * 0.70 },
+            true
+          );
+        } else {
+          const emb = await this.aiEngine.getOrComputeCardEmbeddings(cardEntry.id, cardEntry.safeCanvasElement);
+          cardEntry.feature = emb.feature;
+          cardEntry.centerFeature = emb.centerFeature;
+          cardEntry.tightFeature = emb.tightFeature;
+          if (emb.fromCache) cacheHits++;
+        }
+        cardEntry.aiIndexed = true;
+      } catch (err) {
+        console.warn(`特徴抽出エラー (${cardEntry.name_ja}):`, err);
+        cardEntry.aiIndexed = false;
+      }
+
+      if ((i + 1) % 2 === 0 || i === total - 1) {
+        this.setStatusBadge(
+          `🧠 AIベクトル構築中 [${engineLabel}] (${i + 1}/${total}${cacheHits > 0 ? ` / キャッシュ:${cacheHits}` : ''})...`,
+          true
+        );
+        await yieldToUI();
+      }
+    }
+
+    this.setStatusBadge(
+      `✅ AI認識稼働中 [${engineLabel}] (${total}枚 / 実画像:${realCount}枚)`,
+      false
+    );
+    this.renderDBList();
+
+    if (this.aiEngineSelect) this.aiEngineSelect.disabled = false;
+    this.isSwitchingEngine = false;
+  }
+
+  /**
+   * AIエンジンを動的に切り替え（DINOv2-small <-> MobileNet v2）
+   */
+  async switchAIEngine(engineId) {
+    if (this.isSwitchingEngine || this.isRecognizing) return;
+    this.isSwitchingEngine = true;
+    if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
+
+    try {
+      this.setStatusBadge(`🔄 AIエンジン切替中 (${engineId})...`, true);
+      const actualEngine = await this.aiEngine.init(engineId, (msg) => {
+        this.setStatusBadge(`🔄 ${msg}`, true);
+      });
+
+      if (this.aiEngineSelect && (actualEngine === 'dinov2' || actualEngine === 'mobilenet')) {
+        this.aiEngineSelect.value = actualEngine;
+      }
+
+      await this.rebuildAllCardEmbeddings(false);
+    } catch (err) {
+      console.error('Engine switch error:', err);
+      this.setStatusBadge('⚠️ エンジン切替エラー: ' + err.message, false);
+    } finally {
+      if (this.aiEngineSelect) this.aiEngineSelect.disabled = false;
+      this.isSwitchingEngine = false;
+    }
+
+    // 直前の選択範囲があれば新しいエンジンで自動再認識してすぐ比較できる
+    if (this.lastSelectionBox) {
+      await this.recognizeRegion(this.lastSelectionBox, Boolean(this.lastSelectionWasDrag));
+    }
   }
 
   async fetchImageAsSafeCanvas(url) {
@@ -181,8 +371,8 @@ class YgoRemoteLensApp {
           clearTimeout(timer);
           try {
             const c = document.createElement('canvas');
-            c.width = img.naturalWidth || 180;
-            c.height = img.naturalHeight || 180;
+            c.width = img.naturalWidth || 224;
+            c.height = img.naturalHeight || 224;
             const ctx = c.getContext('2d');
             ctx.drawImage(img, 0, 0);
             ctx.getImageData(0, 0, 1, 1);
@@ -201,7 +391,7 @@ class YgoRemoteLensApp {
       });
 
     const urlsToTry = [
-      `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=200&h=200&fit=cover&output=jpg`,
+      `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=256&h=256&fit=cover&output=jpg`,
       url,
       `https://corsproxy.io/?${encodeURIComponent(url)}`
     ];
@@ -216,212 +406,22 @@ class YgoRemoteLensApp {
     throw new Error('Image load failed');
   }
 
-  /**
-   * 実カード画像から「全体」「84%内枠」「72%中心コア」の3段階の特徴量を抽出して登録
-   * → カメラ撮影時にカードの茶色い外枠が少し入っても、逆にイラスト内側だけを小さく囲んでも高スコアが出る！
-   */
-  async upgradeCardWithRealImage(cardEntry) {
-    try {
-      const safeCanvas = await this.fetchImageAsSafeCanvas(cardEntry.image_crop);
-      const W = safeCanvas.width;
-      const H = safeCanvas.height;
-
-      const feature = this.extractFeatureFromImage(safeCanvas, 0);
-      const centerFeature = this.extractFeatureFromImage(safeCanvas, 0, {
-        x: W * 0.08,
-        y: H * 0.08,
-        w: W * 0.84,
-        h: H * 0.84
-      });
-      const tightFeature = this.extractFeatureFromImage(safeCanvas, 0, {
-        x: W * 0.15,
-        y: H * 0.15,
-        w: W * 0.70,
-        h: H * 0.70
-      });
-
-      cardEntry.safeCanvasElement = safeCanvas;
-      cardEntry.feature = feature;
-      cardEntry.centerFeature = centerFeature;
-      cardEntry.tightFeature = tightFeature;
-      cardEntry.isFallback = false;
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
   createFallbackCardArt(card) {
     const c = document.createElement('canvas');
-    c.width = 180;
-    c.height = 180;
+    c.width = 224;
+    c.height = 224;
     const ctx = c.getContext('2d');
     const hue = (card.id * 137) % 360;
-    const grad = ctx.createLinearGradient(0, 0, 180, 180);
+    const grad = ctx.createLinearGradient(0, 0, 224, 224);
     grad.addColorStop(0, `hsl(${hue}, 70%, 35%)`);
     grad.addColorStop(1, `hsl(${(hue + 60) % 360}, 80%, 20%)`);
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 180, 180);
+    ctx.fillRect(0, 0, 224, 224);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 16px sans-serif';
+    ctx.font = 'bold 18px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(card.name_ja.slice(0, 7), 90, 95);
+    ctx.fillText(card.name_ja.slice(0, 7), 112, 118);
     return c;
-  }
-
-  /**
-   * 改良版特徴ベクトル抽出（ディヴェル等の暗色・単色系イラストにも強いハイブリッド特徴量）
-   * - 各ピクセルで以下の7要素を抽出：
-   *   1-3) Global正規化RGB（赤茶色や青色といった「イラスト全体の色調・単色カラー特徴」を保持！）
-   *   4)   局所コントラスト輝度（暗いカードの中のハープやキャラクターの明暗シルエットを強調！）
-   *   5)   赤-青の色差 (R-B) ＆ 緑-赤青の色差（照明の明るさに左右されない純粋な色相特徴！）
-   *   6-7) 縦横の輝度エッジ勾配（イラストの輪郭・構図！）
-   */
-  extractFeatureFromImage(source, rotateDeg = 0, cropRect = null) {
-    const size = FEATURE_GRID_SIZE;
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = size;
-    offCanvas.height = size;
-    const ctx = offCanvas.getContext('2d');
-
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-
-    ctx.save();
-    if (rotateDeg !== 0) {
-      ctx.translate(size / 2, size / 2);
-      ctx.rotate((rotateDeg * Math.PI) / 180);
-      ctx.translate(-size / 2, -size / 2);
-    }
-
-    if (cropRect) {
-      ctx.drawImage(
-        source,
-        cropRect.x,
-        cropRect.y,
-        cropRect.w,
-        cropRect.h,
-        0,
-        0,
-        size,
-        size
-      );
-    } else {
-      ctx.drawImage(source, 0, 0, size, size);
-    }
-    ctx.restore();
-
-    const imgData = ctx.getImageData(0, 0, size, size).data;
-    const count = size * size;
-
-    const rArr = new Float32Array(count);
-    const gArr = new Float32Array(count);
-    const bArr = new Float32Array(count);
-    const luma = new Float32Array(count);
-
-    let sumR = 0, sumG = 0, sumB = 0, sumL = 0;
-    for (let i = 0; i < count; i++) {
-      const r = imgData[i * 4];
-      const g = imgData[i * 4 + 1];
-      const b = imgData[i * 4 + 2];
-      const l = 0.299 * r + 0.587 * g + 0.114 * b;
-      rArr[i] = r;
-      gArr[i] = g;
-      bArr[i] = b;
-      luma[i] = l;
-      sumR += r;
-      sumG += g;
-      sumB += b;
-      sumL += l;
-    }
-
-    const meanR = sumR / count;
-    const meanG = sumG / count;
-    const meanB = sumB / count;
-    const meanL = sumL / count;
-    // 全チャンネル共通の平均輝度
-    const globalMean = (meanR + meanG + meanB) / 3;
-
-    let varGlobal = 0;
-    let varLuma = 0;
-    for (let i = 0; i < count; i++) {
-      const dr = rArr[i] - globalMean;
-      const dg = gArr[i] - globalMean;
-      const db = bArr[i] - globalMean;
-      varGlobal += dr * dr + dg * dg + db * db;
-
-      const dl = luma[i] - meanL;
-      varLuma += dl * dl;
-    }
-
-    // 重要：チャンネル別ではなく全RGB共通の標準偏差で割ることで、
-    // 『ディヴェル』のような「全体が赤茶色」「全体が青色」という単色カラーの個性が消えずに残る！
-    const stdGlobal = Math.sqrt(varGlobal / (count * 3)) || 1;
-    const stdLuma = Math.sqrt(varLuma / count) || 1;
-
-    const DIM_PER_PIXEL = 7;
-    const vec = new Float32Array(count * DIM_PER_PIXEL);
-    let normSq = 0;
-
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        const i = y * size + x;
-        const dx = (x - (size - 1) / 2) / (size / 2);
-        const dy = (y - (size - 1) / 2) / (size / 2);
-        // 外周（カード枠が混ざりやすい端っこ）の重みを下げ、イラスト中心〜中間の重みを高める
-        const spatialWeight = Math.max(0.35, 1.2 - 0.55 * (dx * dx + dy * dy));
-
-        // 1〜3: 固有の色味を残した正規化RGB
-        const gr = ((rArr[i] - globalMean) / stdGlobal) * 0.75 * spatialWeight;
-        const gg = ((gArr[i] - globalMean) / stdGlobal) * 0.75 * spatialWeight;
-        const gb = ((bArr[i] - globalMean) / stdGlobal) * 0.75 * spatialWeight;
-
-        // 4: 照明の明るさ・暗さに影響されない純粋な明暗シルエット（暗いカードの模様をくっきり浮き上がらせる）
-        const nl = ((luma[i] - meanL) / stdLuma) * 1.15 * spatialWeight;
-
-        // 5: 照明変化に強い色相差分（赤み vs 青み）
-        const chromaRB = (((rArr[i] - bArr[i]) - (meanR - meanB)) / stdGlobal) * 0.85 * spatialWeight;
-
-        // 6〜7: エッジ勾配（形の輪郭）
-        const rightIdx = y * size + Math.min(size - 1, x + 1);
-        const downIdx = Math.min(size - 1, y + 1) * size + x;
-        const gx = ((luma[rightIdx] - luma[i]) / (stdLuma * 1.2)) * 0.9 * spatialWeight;
-        const gy = ((luma[downIdx] - luma[i]) / (stdLuma * 1.2)) * 0.9 * spatialWeight;
-
-        const base = i * DIM_PER_PIXEL;
-        vec[base] = gr;
-        vec[base + 1] = gg;
-        vec[base + 2] = gb;
-        vec[base + 3] = nl;
-        vec[base + 4] = chromaRB;
-        vec[base + 5] = gx;
-        vec[base + 6] = gy;
-
-        normSq +=
-          gr * gr +
-          gg * gg +
-          gb * gb +
-          nl * nl +
-          chromaRB * chromaRB +
-          gx * gx +
-          gy * gy;
-      }
-    }
-
-    const norm = Math.sqrt(normSq) || 1;
-    for (let i = 0; i < vec.length; i++) {
-      vec[i] /= norm;
-    }
-
-    return vec;
-  }
-
-  cosineSimilarity(vecA, vecB) {
-    let dot = 0;
-    for (let i = 0; i < vecA.length; i++) {
-      dot += vecA[i] * vecB[i];
-    }
-    return dot;
   }
 
   startDemoBoard() {
@@ -516,7 +516,6 @@ class YgoRemoteLensApp {
       this.lastSelectionBox = null;
       this.bestMatchedSubBox = null;
 
-      // カメラ許可後にデバイス名（Camo等）が取得できるようになるのでリストを更新
       await this.refreshCameraList();
     } catch (err) {
       alert('Webカメラの起動に失敗しました。\n' + err.message);
@@ -582,7 +581,7 @@ class YgoRemoteLensApp {
         this.drawSelectionOverlay(ctx, this.lastSelectionBox, 'rgba(251, 191, 36, 0.55)', '選択範囲');
       }
       if (this.bestMatchedSubBox) {
-        this.drawSelectionOverlay(ctx, this.bestMatchedSubBox, '#10b981', '🎯 認識エリア');
+        this.drawSelectionOverlay(ctx, this.bestMatchedSubBox, '#10b981', '🎯 AI認識エリア');
       }
     }
   }
@@ -617,8 +616,8 @@ class YgoRemoteLensApp {
 
     ctx.fillStyle = 'rgba(148, 163, 184, 0.75)';
     ctx.font = 'bold 13px sans-serif';
-    ctx.fillText('【相手フィールド（180°逆さま配置：ディヴェル・ギルス・うらら）】 ← クリックして認識！', 50, 35);
-    ctx.fillText('【自分フィールド（正位置配置）】 ← クリックまたはイラスト部分をドラッグで囲んで認識！', 50, H - 20);
+    ctx.fillText('【相手フィールド（180°逆さま配置：ディヴェル・ギルス・うらら）】 ← クリックしてAI認識！', 50, 35);
+    ctx.fillText('【自分フィールド（正位置配置）】 ← クリックまたはイラスト部分をドラッグで囲んでAI認識！', 50, H - 20);
 
     for (const item of this.demoBoardCards) {
       ctx.save();
@@ -676,7 +675,7 @@ class YgoRemoteLensApp {
   }
 
   onCanvasMouseDown(e) {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || this.isRecognizing || this.isSwitchingEngine) return;
     const pos = this.getCanvasCoords(e);
     this.isDragging = true;
     this.dragStart = pos;
@@ -696,15 +695,18 @@ class YgoRemoteLensApp {
     const dx = Math.abs(this.dragCurrent.x - this.dragStart.x);
     const dy = Math.abs(this.dragCurrent.y - this.dragStart.y);
 
+    const isDrag = dx >= 12 || dy >= 12;
+    this.lastClickWasDemoCard = false;
+    this.lastSelectionWasDrag = isDrag;
     let targetBox;
-    if (dx < 12 && dy < 12) {
+    if (!isDrag) {
       targetBox = this.determineClickCropBox(this.dragStart.x, this.dragStart.y);
     } else {
       targetBox = this.getNormalizedDragRect();
     }
 
     this.lastSelectionBox = targetBox;
-    this.recognizeRegion(targetBox);
+    this.recognizeRegion(targetBox, isDrag);
   }
 
   determineClickCropBox(clickX, clickY) {
@@ -716,12 +718,13 @@ class YgoRemoteLensApp {
           clickY >= item.y &&
           clickY <= item.y + item.h
         ) {
-          const artW = item.w * 0.76;
+          this.lastClickWasDemoCard = true;
+          const artW = item.w * 0.78;
           const artH = artW;
           const artX = item.x + (item.w - artW) / 2;
           const artY = item.upsideDown
-            ? item.y + item.h - item.h * 0.19 - artH
-            : item.y + item.h * 0.19;
+            ? item.y + item.h - item.h * 0.175 - artH
+            : item.y + item.h * 0.175;
           return { x: artX, y: artY, w: artW, h: artH };
         }
       }
@@ -741,77 +744,95 @@ class YgoRemoteLensApp {
     return { x, y, w, h };
   }
 
-  generateSearchWindows(box, isDragBox) {
+  /**
+   * AI推論向けに厳選したマルチスケール探索ウィンドウを生成
+   * 深層AI特徴量は微小な位置ズレに強いため、不要な細かすぎるスライドを省いて高速＆高精度化
+   */
+  generateAISearchWindows(box, isDragBox) {
     const windows = [];
     const W = this.mainCanvas.width;
     const H = this.mainCanvas.height;
 
     const addWin = (x, y, w, h) => {
-      const cw = Math.max(20, Math.min(W, w));
-      const ch = Math.max(20, Math.min(H, h));
+      const cw = Math.max(24, Math.min(W, w));
+      const ch = Math.max(24, Math.min(H, h));
       const cx = Math.max(0, Math.min(W - cw, x));
       const cy = Math.max(0, Math.min(H - ch, y));
       windows.push({ x: cx, y: cy, w: cw, h: ch });
     };
 
-    // 1. ユーザーが囲んだ枠そのまま
-    addWin(box.x, box.y, box.w, box.h);
+    // デモ盤面のカードクリック時は正確なイラスト領域が確定しているため1枠のみ（4方向=4推論で最速）
+    if (this.lastClickWasDemoCard) {
+      addWin(box.x, box.y, box.w, box.h);
+      return windows;
+    }
 
     const centerX = box.x + box.w / 2;
     const centerY = box.y + box.h / 2;
     const baseSide = Math.min(box.w, box.h);
 
-    // ドラッグで明示的にイラストを囲んだ場合は、外側の茶色いカード枠を拾いすぎないように内側〜等倍中心（0.7〜1.15倍）に絞る
-    const scales = isDragBox
-      ? [0.72, 0.85, 0.94, 1.0, 1.12]
-      : [0.6, 0.8, 1.0, 1.35, 1.8, 2.3];
+    if (isDragBox) {
+      // 1) ユーザーが囲んだ枠そのまま
+      addWin(box.x, box.y, box.w, box.h);
 
-    const shifts = [
-      [0, 0],
-      [0, -0.10],
-      [0, 0.10],
-      [-0.10, 0],
-      [0.10, 0]
-    ];
-
-    for (const s of scales) {
-      const side = baseSide * s;
-      for (const [sx, sy] of shifts) {
-        addWin(
-          centerX - side / 2 + side * sx,
-          centerY - side / 2 + side * sy,
-          side,
-          side
-        );
+      // 2) 縦長のカード全体をドラッグで囲んだ場合、正位置・逆位置のイラスト領域を自動抽出
+      if (box.h > box.w * 1.18) {
+        const artSide = box.w * 0.78;
+        addWin(box.x + (box.w - artSide) / 2, box.y + box.h * 0.175, artSide, artSide);
+        addWin(box.x + (box.w - artSide) / 2, box.y + box.h - box.h * 0.175 - artSide, artSide, artSide);
+      } else if (box.w > box.h * 1.18) {
+        // 横向き（守備表示）のカード全体を囲んだ場合
+        const artSide = box.h * 0.78;
+        addWin(box.x + box.w * 0.175, box.y + (box.h - artSide) / 2, artSide, artSide);
+        addWin(box.x + box.w - box.w * 0.175 - artSide, box.y + (box.h - artSide) / 2, artSide, artSide);
+      } else {
+        // 正方形に近くイラストを囲んだ場合：外枠の茶色いフチを除外した内側84%もチェック
+        const innerSide = baseSide * 0.84;
+        addWin(centerX - innerSide / 2, centerY - innerSide / 2, innerSide, innerSide);
       }
-    }
-
-    // 縦長のカード全体をドラッグで囲んだ場合のイラスト枠（正位置・逆位置）
-    if (box.h > box.w * 1.15) {
-      const artSide = box.w * 0.76;
-      addWin(box.x + (box.w - artSide) / 2, box.y + box.h * 0.18, artSide, artSide);
-      addWin(box.x + (box.w - artSide) / 2, box.y + box.h - box.h * 0.18 - artSide, artSide, artSide);
+    } else {
+      // ワンクリック時：標準(100%) + 小(76%) + 大(128%) の3スケールでカバー
+      const scales = [1.0, 0.76, 1.28];
+      for (const s of scales) {
+        const side = baseSide * s;
+        addWin(centerX - side / 2, centerY - side / 2, side, side);
+      }
     }
 
     return windows;
   }
 
-  recognizeRegion(box) {
-    if (this.cardsDB.length === 0) {
-      this.matchStatusText.textContent = '⚠️ カードDBがまだ読み込まれていません';
+  /**
+   * 選択領域をブラウザ内AIで非同期認識
+   */
+  async recognizeRegion(box, isDragBox = false) {
+    if (this.isRecognizing || this.isSwitchingEngine) return;
+
+    const indexedCards = this.cardsDB.filter((c) => c.feature);
+    if (!this.aiEngine.isReady || indexedCards.length === 0) {
+      this.matchStatusText.textContent = '⏳ AIモデルとカードDBの準備完了をお待ちください...';
       return;
     }
 
-    try {
-      const dx = Math.abs(this.dragCurrent.x - this.dragStart.x);
-      const dy = Math.abs(this.dragCurrent.y - this.dragStart.y);
-      const isDragBox = dx >= 12 || dy >= 12;
+    this.isRecognizing = true;
+    const startTime = performance.now();
 
+    try {
+      // 1) 選択枠オーバーレイを含まないクリーンな現在フレームをオフスクリーンにスナップショット
       this.lastSelectionBox = null;
       this.bestMatchedSubBox = null;
       this.drawFrame();
 
-      const searchWindows = this.generateSearchWindows(box, isDragBox);
+      const snapshotCanvas = document.createElement('canvas');
+      snapshotCanvas.width = this.mainCanvas.width;
+      snapshotCanvas.height = this.mainCanvas.height;
+      snapshotCanvas.getContext('2d').drawImage(this.mainCanvas, 0, 0);
+
+      // 選択枠を即座に戻して視覚フィードバックを維持
+      this.lastSelectionBox = box;
+
+      const enhanceLighting = this.enhanceLightingCheck ? this.enhanceLightingCheck.checked : true;
+      const searchWindows = this.generateAISearchWindows(box, isDragBox);
       const orientations = [
         { deg: 0, label: '正位置 (0°)' },
         { deg: 180, label: '相手視点・逆さま (180°)' },
@@ -819,31 +840,49 @@ class YgoRemoteLensApp {
         { deg: 270, label: '横向き・守備 (270°)' }
       ];
 
+      const totalSteps = searchWindows.length * orientations.length;
+      let doneSteps = 0;
+
+      this.matchStatusText.textContent = `🤖 AI解析中... (0/${totalSteps})`;
+      this.matchBadgeContainer.innerHTML = `<span class="match-badge processing">${this.aiEngine.getEngineLabel()} で照合中</span>`;
+
       const queries = [];
       for (const win of searchWindows) {
         for (const ori of orientations) {
+          const vec = await this.aiEngine.extractEmbedding(snapshotCanvas, ori.deg, win, enhanceLighting);
           queries.push({
             win,
+            deg: ori.deg,
             orientation: ori.label,
-            vec: this.extractFeatureFromImage(this.mainCanvas, ori.deg, win)
+            vec
           });
+          doneSteps++;
+          this.matchStatusText.textContent = `🤖 AI解析中... (${doneSteps}/${totalSteps})`;
+          await yieldToUI();
         }
       }
 
-      const scored = this.cardsDB.map((card) => {
+      // 全登録カード（3クロップ）とのコサイン類似度を算出
+      const scored = indexedCards.map((card) => {
         let bestSim = -1;
         let bestOrientation = '正位置 (0°)';
+        let bestDeg = 0;
         let bestWin = box;
 
         for (const q of queries) {
-          const simFull = this.cosineSimilarity(q.vec, card.feature);
-          const simCenter = this.cosineSimilarity(q.vec, card.centerFeature || card.feature);
-          const simTight = this.cosineSimilarity(q.vec, card.tightFeature || card.feature);
+          const simFull = this.aiEngine.cosineSimilarity(q.vec, card.feature);
+          const simCenter = card.centerFeature
+            ? this.aiEngine.cosineSimilarity(q.vec, card.centerFeature)
+            : -1;
+          const simTight = card.tightFeature
+            ? this.aiEngine.cosineSimilarity(q.vec, card.tightFeature)
+            : -1;
           const sim = Math.max(simFull, simCenter, simTight);
 
           if (sim > bestSim) {
             bestSim = sim;
             bestOrientation = q.orientation;
+            bestDeg = q.deg;
             bestWin = q.win;
           }
         }
@@ -852,46 +891,66 @@ class YgoRemoteLensApp {
           card,
           score: bestSim,
           orientation: bestOrientation,
+          deg: bestDeg,
           matchedBox: bestWin
         };
       });
 
       scored.sort((a, b) => b.score - a.score);
 
+      const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
       const topMatch = scored[0];
+      const secondMatch = scored[1];
+      const margin = topMatch && secondMatch ? topMatch.score - secondMatch.score : 1;
       const top5 = scored.slice(0, 5);
 
+      // 実際にAIが見た（補正・回転済みの）ベストマッチ領域をプレビューに表示
       const finalCropBox = topMatch ? topMatch.matchedBox : box;
-      this.cropPreviewCtx.clearRect(0, 0, 64, 64);
-      this.cropPreviewCtx.drawImage(
-        this.mainCanvas,
-        finalCropBox.x,
-        finalCropBox.y,
-        finalCropBox.w,
-        finalCropBox.h,
-        0,
-        0,
-        64,
-        64
+      const previewCanvas = this.aiEngine.preprocessToCanvas(
+        snapshotCanvas,
+        topMatch ? topMatch.deg : 0,
+        finalCropBox,
+        enhanceLighting
       );
+      this.cropPreviewCtx.clearRect(0, 0, 64, 64);
+      this.cropPreviewCtx.drawImage(previewCanvas, 0, 0, 64, 64);
 
       this.lastSelectionBox = box;
       this.bestMatchedSubBox = finalCropBox;
 
-      this.displayRecognitionResult(topMatch, top5);
+      const meta = {
+        elapsedSec,
+        margin,
+        engineLabel: this.aiEngine.getEngineLabel()
+      };
+
+      this.displayRecognitionResult(topMatch, top5, meta);
       this.addToHistory(topMatch);
     } catch (err) {
       console.error('Recognition error:', err);
-      this.matchStatusText.textContent = '⚠️ 認識処理エラー: ' + err.message;
+      this.matchStatusText.textContent = '⚠️ AI認識エラー: ' + err.message;
+      this.matchBadgeContainer.innerHTML = '';
+    } finally {
+      this.isRecognizing = false;
     }
   }
 
-  displayRecognitionResult(match, topCandidates) {
+  displayRecognitionResult(match, topCandidates, meta = null) {
     const { card, score, orientation } = match;
-    const percent = Math.max(0, Math.min(99.9, ((score + 1) / 2) * 100)).toFixed(1);
+    // AI埋め込みのコサイン類似度（0〜1）を直感的なパーセント表示に変換
+    const clampedScore = Math.max(0, Math.min(1, score));
+    const percent = (clampedScore * 100).toFixed(1);
 
     this.matchStatusText.textContent = `向き判定: ${orientation}`;
-    this.matchBadgeContainer.innerHTML = `<span class="match-badge">一致度スコア: ${percent}%</span>`;
+
+    const isHighConfidence = !meta || meta.margin >= 0.04 || clampedScore >= 0.72;
+    const badgeClass = isHighConfidence ? 'match-badge' : 'match-badge medium';
+    const confidenceLabel = isHighConfidence ? '✅ 高信頼' : '⚠️ 候補確認推奨';
+    const engineSuffix = meta
+      ? `<span class="engine-badge">${meta.engineLabel} / ${meta.elapsedSec}s</span>`
+      : '';
+
+    this.matchBadgeContainer.innerHTML = `<span class="${badgeClass}">${confidenceLabel} 類似度: ${percent}%</span>${engineSuffix}`;
 
     const imgSrc = card.image_full;
 
@@ -921,7 +980,7 @@ class YgoRemoteLensApp {
     this.candidatesSection.style.display = 'block';
     this.candidatesList.innerHTML = '';
     topCandidates.forEach((item, idx) => {
-      const p = Math.max(0, Math.min(99.9, ((item.score + 1) / 2) * 100)).toFixed(0);
+      const p = (Math.max(0, Math.min(1, item.score)) * 100).toFixed(1);
       const thumbSrc = item.card.image_crop;
 
       const div = document.createElement('div');
@@ -932,7 +991,7 @@ class YgoRemoteLensApp {
         <div class="candidate-score">${idx + 1}位 (${p}%)</div>
       `;
       div.addEventListener('click', () => {
-        this.displayRecognitionResult(item, topCandidates);
+        this.displayRecognitionResult(item, topCandidates, meta);
       });
       this.candidatesList.appendChild(div);
     });
@@ -968,7 +1027,7 @@ class YgoRemoteLensApp {
     this.dbCount.textContent = this.cardsDB.length;
     this.dbCardList.innerHTML = '';
     this.cardsDB.forEach((card) => {
-      const statusIcon = card.isFallback ? '⏳' : '✅';
+      const statusIcon = card.aiIndexed && !card.isFallback ? '🤖' : card.isFallback ? '⏳' : '🖼️';
       const div = document.createElement('div');
       div.className = 'history-item';
       div.innerHTML = `
@@ -1018,17 +1077,30 @@ class YgoRemoteLensApp {
         const entry = {
           ...newCard,
           safeCanvasElement: fallbackCanvas,
-          feature: this.extractFeatureFromImage(fallbackCanvas, 0),
-          isFallback: true
+          feature: null,
+          centerFeature: null,
+          tightFeature: null,
+          isFallback: true,
+          aiIndexed: false
         };
         this.cardsDB.push(entry);
-        await this.upgradeCardWithRealImage(entry);
+        await this.loadRealImageForCard(entry);
+        if (this.aiEngine.isReady) {
+          const emb = await this.aiEngine.getOrComputeCardEmbeddings(entry.id, entry.safeCanvasElement);
+          entry.feature = emb.feature;
+          entry.centerFeature = emb.centerFeature;
+          entry.tightFeature = emb.tightFeature;
+          entry.aiIndexed = true;
+        }
         added++;
       }
 
       this.renderDBList();
-      this.dbStatusBadge.textContent = `✅ 認識エンジン稼働中 (${this.cardsDB.length}枚登録済)`;
-      alert(`${added}枚の新しいカードを認識データベースに追加しました！`);
+      this.setStatusBadge(
+        `✅ AI認識稼働中 [${this.aiEngine.getEngineLabel()}] (${this.cardsDB.length}枚登録済)`,
+        false
+      );
+      alert(`${added}枚の新しいカードをAI認識データベースに追加しました！`);
       input.value = '';
     } catch (err) {
       alert('API検索エラー: ' + err.message);

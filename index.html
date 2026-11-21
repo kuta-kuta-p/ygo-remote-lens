@@ -279,6 +279,26 @@
       width: fit-content;
     }
 
+    .match-badge.medium {
+      background-color: #78350f;
+      color: #fde68a;
+    }
+
+    .match-badge.processing {
+      background-color: #1e3a8a;
+      color: #93c5fd;
+    }
+
+    .engine-badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      background-color: #312e81;
+      color: #c7d2fe;
+      margin-left: 6px;
+    }
+
     /* 認識されたカード詳細 */
     .card-detail {
       display: flex;
@@ -526,15 +546,26 @@
     <section class="viewport-area">
       <div class="toolbar-sub">
         <div>
-          💡 <strong>使い方:</strong> 盤面のカードを<strong>クリック</strong>（または<strong>ドラッグで四角く囲む</strong>）と、右側にカード効果が出ます（逆さまのカードも自動判定！）
+          💡 <strong>使い方:</strong> 盤面のカードを<strong>クリック</strong>（または<strong>ドラッグで四角く囲む</strong>）と、AIが右側にカード効果を出します（逆さま・暗所・反射対応！）
         </div>
         <div class="mode-switch">
+          <label title="認識に使用するブラウザ内AIモデルを選択します">
+            AIエンジン:
+            <select id="aiEngineSelect" style="background:#0f172a; color:#38bdf8; font-weight:600; border:1px solid #475569; border-radius:4px; padding:2px 6px;">
+              <option value="dinov2" selected>🎯 DINOv2-small (高精度AI)</option>
+              <option value="mobilenet">⚡ MobileNet v2 (高速WebGL)</option>
+            </select>
+          </label>
+          <label title="暗いカード（ディヴェル等）やスリーブの光反射を自動で補正してからAIに認識させます">
+            <input type="checkbox" id="enhanceLightingCheck" checked />
+            暗所・反射補正
+          </label>
           <label>
-            クリック切り抜きサイズ:
+            クリック枠:
             <select id="cropSizeSelect" style="background:#0f172a; color:#fff; border:1px solid #475569; border-radius:4px; padding:2px 6px;">
-              <option value="90">小 (遠めのカメラ)</option>
+              <option value="90">小 (遠め)</option>
               <option value="130" selected>中 (標準)</option>
-              <option value="180">大 (アップ画面)</option>
+              <option value="180">大 (アップ)</option>
             </select>
           </label>
         </div>
@@ -561,7 +592,7 @@
         <div class="crop-debug-bar">
           <canvas id="cropPreviewCanvas" width="64" height="64"></canvas>
           <div class="crop-info">
-            <div id="matchStatusText">盤面のカードをクリックまたはドラッグで選択してください</div>
+            <div id="matchStatusText">AIモデルとカードDBを準備しています...</div>
             <div id="matchBadgeContainer"></div>
           </div>
         </div>
@@ -570,7 +601,8 @@
           <div class="empty-state">
             👈 左の画面に映っているカードを<br />
             <strong>クリック</strong> または <strong>ドラッグで囲む</strong> と、<br />
-            ここに高画質画像と日本語効果テキストが表示されます。
+            ブラウザ内AIがカードを特定し、<br />
+            ここに高画質画像と日本語効果テキストを表示します。
           </div>
         </div>
 
@@ -593,8 +625,13 @@
           <input type="text" id="addCardQuery" placeholder="英語名やキーワードでAPIからカード追加 (例: Blue-Eyes)" />
           <button id="btnAddFromApi" class="primary">追加</button>
         </div>
-        <div style="font-size: 0.75rem; color: var(--text-sub); margin-bottom: 6px;">
-          ※プロトタイプ初期状態では代表的な人気カード・汎用カードを内蔵しています。上の検索からYGOPRODeck API経由で任意のカードを追加して認識対象を増やせます。
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px;">
+          <div style="font-size: 0.75rem; color: var(--text-sub);">
+            ※AI特徴ベクトルはブラウザ(IndexedDB)に自動キャッシュされ、次回起動が高速化されます。
+          </div>
+          <button id="btnClearAiCache" style="font-size:0.72rem; padding:4px 8px; flex-shrink:0;" title="キャッシュされたAI特徴ベクトルを削除して再計算します">
+            🔄 キャッシュ再生成
+          </button>
         </div>
         <div class="history-list" id="dbCardList"></div>
       </div>
@@ -602,6 +639,7 @@
   </main>
 
   <script src="cards_data.js"></script>
+  <script src="ai_engine.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
