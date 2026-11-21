@@ -1,0 +1,23 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# Environment / Secrets
+.env
+.env.local
+.env.*.local
+
+# Logs & Temp
+*.log
+tmp/
+temp/
+
+# Future Python / Node dependencies
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/

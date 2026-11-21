@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>YGO Remote Lens - 遊戯王リモート対戦 カード認識ツール (PoC)</title>
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --bg-panel: #1e293b;
+      --bg-card: #334155;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --gold: #fbbf24;
+      --text-main: #f8fafc;
+      --text-sub: #94a3b8;
+      --border: #475569;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Segoe UI', 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ヘッダー */
+    header {
+      background-color: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .logo-area {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--gold);
+      letter-spacing: 0.5px;
+    }
+
+    .db-status {
+      font-size: 0.8rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #064e3b;
+      color: #6ee7b7;
+      border: 1px solid #047857;
+    }
+
+    .db-status.loading {
+      background: #78350f;
+      color: #fcd34d;
+      border-color: #b45309;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button, .btn-label {
+      background-color: var(--bg-card);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    button:hover, .btn-label:hover {
+      background-color: #475569;
+    }
+
+    button.primary {
+      background-color: var(--accent);
+      color: #0f172a;
+      border-color: var(--accent);
+    }
+
+    button.primary:hover {
+      background-color: var(--accent-hover);
+      color: #fff;
+    }
+
+    button.demo-btn {
+      background-color: #6366f1;
+      border-color: #818cf8;
+      color: #fff;
+    }
+
+    button.demo-btn:hover {
+      background-color: #4f46e5;
+    }
+
+    /* メインレイアウト */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 420px;
+      overflow: hidden;
+    }
+
+    /* 左側：キャプチャ・認識キャンバスエリア */
+    .viewport-area {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      background-color: #020617;
+      overflow: hidden;
+    }
+
+    .toolbar-sub {
+      background-color: rgba(30, 41, 59, 0.85);
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.82rem;
+      color: var(--text-sub);
+    }
+
+    .mode-switch {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .mode-switch label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      cursor: pointer;
+      color: var(--text-main);
+    }
+
+    .canvas-container {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    /* 映像・キャンバス重ね合わせラッパー */
+    .stage-wrapper {
+      position: relative;
+      max-width: 100%;
+      max-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    video {
+      display: none;
+    }
+
+    #mainCanvas {
+      max-width: 100%;
+      max-height: calc(100vh - 110px);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      cursor: crosshair;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+      background-color: #090d16;
+    }
+
+    /* 右側：カード情報サイドパネル */
+    .side-panel {
+      background-color: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .panel-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      background-color: #0f172a;
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      color: var(--text-sub);
+      font-size: 0.85rem;
+      justify-content: center;
+      border-bottom: 2px solid transparent;
+    }
+
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+      background-color: var(--bg-panel);
+    }
+
+    .panel-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* 認識中の切り抜きプレビュー */
+    .crop-debug-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background-color: rgba(15, 23, 42, 0.65);
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    #cropPreviewCanvas {
+      width: 64px;
+      height: 64px;
+      border-radius: 4px;
+      border: 1px solid var(--accent);
+      background-color: #000;
+      flex-shrink: 0;
+    }
+
+    .crop-info {
+      font-size: 0.78rem;
+      color: var(--text-sub);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .match-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 700;
+      font-size: 0.75rem;
+      background-color: #065f46;
+      color: #6ee7b7;
+      width: fit-content;
+    }
+
+    /* 認識されたカード詳細 */
+    .card-detail {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .card-top {
+      display: flex;
+      gap: 14px;
+    }
+
+    .card-image-box {
+      width: 135px;
+      flex-shrink: 0;
+    }
+
+    .card-image-box img {
+      width: 100%;
+      border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+      border: 1px solid #64748b;
+      cursor: pointer;
+    }
+
+    .card-meta {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .card-name-ja {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--gold);
+      line-height: 1.3;
+    }
+
+    .card-name-en {
+      font-size: 0.78rem;
+      color: var(--text-sub);
+    }
+
+    .card-type-badge {
+      font-size: 0.78rem;
+      padding: 3px 8px;
+      background-color: #334155;
+      border-radius: 4px;
+      color: #e2e8f0;
+      width: fit-content;
+    }
+
+    .card-stats {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: #38bdf8;
+      margin-top: 2px;
+    }
+
+    .card-effect-box {
+      background-color: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .card-effect-title {
+      font-size: 0.75rem;
+      color: var(--text-sub);
+      margin-bottom: 6px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .card-effect-text {
+      font-size: 0.9rem;
+      line-height: 1.65;
+      color: #f1f5f9;
+      white-space: pre-wrap;
+    }
+
+    /* 候補リスト（Top 3） */
+    .candidates-section {
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+
+    .candidates-title {
+      font-size: 0.78rem;
+      color: var(--text-sub);
+      margin-bottom: 8px;
+    }
+
+    .candidates-list {
+      display: flex;
+      gap: 8px;
+    }
+
+    .candidate-item {
+      flex: 1;
+      background-color: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 4px;
+      transition: border-color 0.15s;
+    }
+
+    .candidate-item:hover, .candidate-item.active {
+      border-color: var(--accent);
+      background-color: #1e293b;
+    }
+
+    .candidate-item img {
+      width: 48px;
+      height: 48px;
+      object-fit: cover;
+      border-radius: 4px;
+    }
+
+    .candidate-name {
+      font-size: 0.7rem;
+      color: var(--text-main);
+      display: -webkit-box;
+      -webkit-line-clamp: 1;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .candidate-score {
+      font-size: 0.68rem;
+      color: var(--accent);
+    }
+
+    /* 履歴リスト & DB一覧 */
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background-color: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      cursor: pointer;
+    }
+
+    .history-item:hover {
+      border-color: var(--accent);
+    }
+
+    .history-item img {
+      width: 42px;
+      height: 42px;
+      object-fit: cover;
+      border-radius: 4px;
+    }
+
+    .history-meta {
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .history-name {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--gold);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .history-sub {
+      font-size: 0.72rem;
+      color: var(--text-sub);
+    }
+
+    .search-box {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .search-box input {
+      flex: 1;
+      background-color: #0f172a;
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+
+    .empty-state {
+      text-align: center;
+      color: var(--text-sub);
+      padding: 30px 10px;
+      font-size: 0.85rem;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo-area">
+      <span class="logo-title">👁️ YGO Remote Lens</span>
+      <span id="dbStatusBadge" class="db-status loading">カードDB準備中...</span>
+    </div>
+
+    <div class="controls">
+      <button id="btnDemoBoard" class="demo-btn" title="カメラやDiscordがなくても今すぐクリック認識を試せる仮想デュエル盤面を表示します">
+        🃏 デモ盤面で試す
+      </button>
+      <button id="btnCaptureScreen" class="primary" title="Discordなどの通話ウィンドウを選択してキャプチャします">
+        🖥️ Discord / 画面キャプチャ開始
+      </button>
+      <select id="cameraDeviceSelect" style="background:#1e293b; color:#f8fafc; border:1px solid #475569; border-radius:6px; padding:6px 8px; font-size:0.82rem; max-width:190px;" title="使用するWebカメラ（Camoなど）を選択します">
+        <option value="">📷 カメラ自動選択</option>
+      </select>
+      <button id="btnStartCamera" title="選択したWebカメラの映像を表示します">
+        📷 Webカメラ起動
+      </button>
+      <label class="btn-label" title="手元のカード写真やスクリーンショット画像を読み込んでテストします">
+        📁 画像ファイルを開く
+        <input type="file" id="fileInput" accept="image/*" style="display: none;" />
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <!-- 左：キャプチャ画面＆クリック領域 -->
+    <section class="viewport-area">
+      <div class="toolbar-sub">
+        <div>
+          💡 <strong>使い方:</strong> 盤面のカードを<strong>クリック</strong>（または<strong>ドラッグで四角く囲む</strong>）と、右側にカード効果が出ます（逆さまのカードも自動判定！）
+        </div>
+        <div class="mode-switch">
+          <label>
+            クリック切り抜きサイズ:
+            <select id="cropSizeSelect" style="background:#0f172a; color:#fff; border:1px solid #475569; border-radius:4px; padding:2px 6px;">
+              <option value="90">小 (遠めのカメラ)</option>
+              <option value="130" selected>中 (標準)</option>
+              <option value="180">大 (アップ画面)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="canvas-container" id="canvasContainer">
+        <div class="stage-wrapper">
+          <video id="captureVideo" autoplay playsinline muted></video>
+          <canvas id="mainCanvas" width="960" height="580"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右：認識結果＆日本語テキストパネル -->
+    <aside class="side-panel">
+      <div class="panel-tabs">
+        <button class="tab-btn active" data-tab="detail">🔍 認識結果</button>
+        <button class="tab-btn" data-tab="history">📜 認識履歴 (<span id="historyCount">0</span>)</button>
+        <button class="tab-btn" data-tab="database">🗂️ 登録カード (<span id="dbCount">0</span>)</button>
+      </div>
+
+      <!-- タブ1: 認識結果 -->
+      <div class="panel-content" id="tab-detail">
+        <div class="crop-debug-bar">
+          <canvas id="cropPreviewCanvas" width="64" height="64"></canvas>
+          <div class="crop-info">
+            <div id="matchStatusText">盤面のカードをクリックまたはドラッグで選択してください</div>
+            <div id="matchBadgeContainer"></div>
+          </div>
+        </div>
+
+        <div id="cardDetailContainer">
+          <div class="empty-state">
+            👈 左の画面に映っているカードを<br />
+            <strong>クリック</strong> または <strong>ドラッグで囲む</strong> と、<br />
+            ここに高画質画像と日本語効果テキストが表示されます。
+          </div>
+        </div>
+
+        <div class="candidates-section" id="candidatesSection" style="display: none;">
+          <div class="candidates-title">🤔 類似カード候補（もし認識が違う場合はクリックで切替）</div>
+          <div class="candidates-list" id="candidatesList"></div>
+        </div>
+      </div>
+
+      <!-- タブ2: 履歴 -->
+      <div class="panel-content" id="tab-history" style="display: none;">
+        <div class="history-list" id="historyList">
+          <div class="empty-state">まだ認識されたカードはありません。</div>
+        </div>
+      </div>
+
+      <!-- タブ3: 登録カードDB & 追加 -->
+      <div class="panel-content" id="tab-database" style="display: none;">
+        <div class="search-box">
+          <input type="text" id="addCardQuery" placeholder="英語名やキーワードでAPIからカード追加 (例: Blue-Eyes)" />
+          <button id="btnAddFromApi" class="primary">追加</button>
+        </div>
+        <div style="font-size: 0.75rem; color: var(--text-sub); margin-bottom: 6px;">
+          ※プロトタイプ初期状態では代表的な人気カード・汎用カードを内蔵しています。上の検索からYGOPRODeck API経由で任意のカードを追加して認識対象を増やせます。
+        </div>
+        <div class="history-list" id="dbCardList"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="cards_data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
