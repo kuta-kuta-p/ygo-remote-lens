@@ -177,7 +177,7 @@
    */
   class YgoAIEngine {
     constructor() {
-      this.activeEngine = 'dinov2'; // 'dinov2' | 'mobilenet' | 'legacy'
+      this.activeEngine = 'mobilenet'; // 'dinov2' | 'mobilenet' | 'legacy'
       this.backendInfo = '';
       this.isReady = false;
       this.cache = new EmbeddingCache();
@@ -209,7 +209,7 @@
     /**
      * 指定エンジンを初期化（失敗時は自動フォールバック）
      */
-    async init(engineId = 'dinov2', onProgress = () => {}) {
+    async init(engineId = 'mobilenet', onProgress = () => {}) {
       this.isReady = false;
 
       if (engineId === 'dinov2') {

@@ -17,6 +17,11 @@ class YgoRemoteLensApp {
     this.aiEngine = new window.YgoAIEngine();
     this.cardsDB = [];
     this.history = [];
+    this.pinnedCards = [];
+    this.currentMatch = null;
+    this.currentCardId = null;
+    this.lastRecognizedCardId = null;
+    this.historyFilter = '';
     this.mode = 'demo'; // 'demo' | 'video' | 'image'
     this.loadedImage = null;
     this.videoStream = null;
@@ -33,12 +38,14 @@ class YgoRemoteLensApp {
     this.lastClickWasDemoCard = false;
 
     this.initElements();
+    this.initLayoutState();
     this.bindEvents();
     this.refreshCameraList();
     this.initDatabase();
   }
 
   initElements() {
+    this.mainLayout = document.getElementById('mainLayout');
     this.mainCanvas = document.getElementById('mainCanvas');
     this.ctx = this.mainCanvas.getContext('2d');
     this.video = document.getElementById('captureVideo');
@@ -55,11 +62,57 @@ class YgoRemoteLensApp {
     this.cardDetailContainer = document.getElementById('cardDetailContainer');
     this.candidatesSection = document.getElementById('candidatesSection');
     this.candidatesList = document.getElementById('candidatesList');
+
     this.historyList = document.getElementById('historyList');
     this.historyCount = document.getElementById('historyCount');
+    this.historyFilterInput = document.getElementById('historyFilterInput');
+    this.quickHistoryList = document.getElementById('quickHistoryList');
+    this.quickHistoryCount = document.getElementById('quickHistoryCount');
+    this.btnToggleHistoryRail = document.getElementById('btnToggleHistoryRail');
+    this.btnCollapseRail = document.getElementById('btnCollapseRail');
+    this.btnExpandRailFromStrip = document.getElementById('btnExpandRailFromStrip');
+    this.btnClearHistory = document.getElementById('btnClearHistory');
+
+    this.pinnedCompareSection = document.getElementById('pinnedCompareSection');
+    this.pinnedCardsList = document.getElementById('pinnedCardsList');
+    this.pinnedCount = document.getElementById('pinnedCount');
+    this.btnClearPins = document.getElementById('btnClearPins');
+
     this.dbCardList = document.getElementById('dbCardList');
     this.dbCount = document.getElementById('dbCount');
     this.btnClearAiCache = document.getElementById('btnClearAiCache');
+  }
+
+  initLayoutState() {
+    let collapsed = false;
+    try {
+      const saved = localStorage.getItem('ygo_remote_lens_history_collapsed');
+      if (saved !== null) {
+        collapsed = saved === 'true';
+      } else if (window.innerWidth < 1160) {
+        collapsed = true;
+      }
+    } catch (_) {
+      collapsed = window.innerWidth < 1160;
+    }
+    this.setHistoryCollapsed(collapsed, false);
+  }
+
+  setHistoryCollapsed(collapsed, persist = true) {
+    this.isHistoryCollapsed = Boolean(collapsed);
+    if (this.mainLayout) {
+      this.mainLayout.classList.toggle('history-collapsed', this.isHistoryCollapsed);
+    }
+    if (this.btnToggleHistoryRail) {
+      this.btnToggleHistoryRail.textContent = this.isHistoryCollapsed ? '📜 履歴を開く' : '📜 履歴を畳む';
+    }
+    if (persist) {
+      try {
+        localStorage.setItem('ygo_remote_lens_history_collapsed', String(this.isHistoryCollapsed));
+      } catch (_) {
+        // ストレージ無効環境は無視
+      }
+    }
   }
 
   bindEvents() {
@@ -67,6 +120,35 @@ class YgoRemoteLensApp {
     document.getElementById('btnCaptureScreen').addEventListener('click', () => this.startScreenCapture());
     document.getElementById('btnStartCamera').addEventListener('click', () => this.startCamera());
     document.getElementById('fileInput').addEventListener('change', (e) => this.loadImageFile(e));
+
+    if (this.btnToggleHistoryRail) {
+      this.btnToggleHistoryRail.addEventListener('click', () => {
+        this.setHistoryCollapsed(!this.isHistoryCollapsed);
+      });
+    }
+    if (this.btnCollapseRail) {
+      this.btnCollapseRail.addEventListener('click', () => this.setHistoryCollapsed(true));
+    }
+    if (this.btnExpandRailFromStrip) {
+      this.btnExpandRailFromStrip.addEventListener('click', () => this.setHistoryCollapsed(false));
+    }
+    if (this.btnClearHistory) {
+      this.btnClearHistory.addEventListener('click', () => this.clearHistory());
+    }
+    if (this.historyFilterInput) {
+      this.historyFilterInput.addEventListener('input', (e) => {
+        this.historyFilter = e.target.value.trim().toLowerCase();
+        this.renderHistory();
+      });
+    }
+    if (this.btnClearPins) {
+      this.btnClearPins.addEventListener('click', () => {
+        this.pinnedCards = [];
+        this.renderPinnedCards();
+        this.renderHistory();
+        this.refreshDetailPinButton();
+      });
+    }
 
     if (this.cameraDeviceSelect) {
       this.cameraDeviceSelect.addEventListener('change', () => {
@@ -101,8 +183,9 @@ class YgoRemoteLensApp {
         document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
         const target = btn.getAttribute('data-tab');
-        ['detail', 'history', 'database'].forEach((t) => {
-          document.getElementById(`tab-${t}`).style.display = t === target ? 'flex' : 'none';
+        ['detail', 'database'].forEach((t) => {
+          const el = document.getElementById(`tab-${t}`);
+          if (el) el.style.display = t === target ? 'flex' : 'none';
         });
       });
     });
@@ -177,7 +260,7 @@ class YgoRemoteLensApp {
     this.setStatusBadge('🤖 AIモデル＆カード画像を取得中...', true);
     if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
 
-    const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'dinov2';
+    const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'mobilenet';
 
     // AIモデル読み込みとカード実画像取得を並列で進める
     let aiProgressText = 'AIモデル初期化中...';
@@ -924,8 +1007,9 @@ class YgoRemoteLensApp {
         engineLabel: this.aiEngine.getEngineLabel()
       };
 
-      this.displayRecognitionResult(topMatch, top5, meta);
+      this.lastRecognizedCardId = topMatch ? topMatch.card.id : null;
       this.addToHistory(topMatch);
+      this.displayRecognitionResult(topMatch, top5, meta);
     } catch (err) {
       console.error('Recognition error:', err);
       this.matchStatusText.textContent = '⚠️ AI認識エラー: ' + err.message;
@@ -935,8 +1019,89 @@ class YgoRemoteLensApp {
     }
   }
 
+  escapeHtml(text) {
+    return String(text ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  isCardPinned(cardId) {
+    return this.pinnedCards.some((p) => p.card.id === cardId);
+  }
+
+  togglePinCard(card, orientation = 'ピン留め') {
+    if (!card) return;
+    const idx = this.pinnedCards.findIndex((p) => p.card.id === card.id);
+    if (idx !== -1) {
+      this.pinnedCards.splice(idx, 1);
+    } else {
+      this.pinnedCards.push({ card, orientation });
+      if (this.pinnedCards.length > 2) {
+        this.pinnedCards.shift();
+      }
+    }
+    this.renderPinnedCards();
+    this.renderHistory();
+    this.refreshDetailPinButton();
+  }
+
+  refreshDetailPinButton() {
+    const btn = document.getElementById('btnPinActiveCard');
+    if (!btn || !this.currentMatch) return;
+    const pinned = this.isCardPinned(this.currentMatch.card.id);
+    btn.classList.toggle('pinned', pinned);
+    btn.textContent = pinned ? '📌 ピン留め中（クリックで解除）' : '📌 比較用にピン留め';
+  }
+
+  renderPinnedCards() {
+    if (!this.pinnedCompareSection || !this.pinnedCardsList || !this.pinnedCount) return;
+
+    this.pinnedCount.textContent = this.pinnedCards.length;
+    if (this.pinnedCards.length === 0) {
+      this.pinnedCompareSection.style.display = 'none';
+      this.pinnedCardsList.innerHTML = '';
+      return;
+    }
+
+    this.pinnedCompareSection.style.display = 'flex';
+    this.pinnedCardsList.innerHTML = '';
+
+    this.pinnedCards.forEach((item) => {
+      const { card } = item;
+      const box = document.createElement('div');
+      box.className = 'pinned-card-box';
+      box.innerHTML = `
+        <div class="pinned-card-head">
+          <img src="${this.escapeHtml(card.image_crop)}" alt="${this.escapeHtml(card.name_ja)}" />
+          <div class="pinned-card-meta">
+            <div class="pinned-card-name">${this.escapeHtml(card.name_ja)}</div>
+            <div class="pinned-card-sub">${this.escapeHtml(card.stats_ja)}</div>
+          </div>
+          <button class="icon-btn btn-pinned-focus" title="このカードをメイン詳細に表示">拡大</button>
+          <button class="icon-btn btn-pinned-remove" title="ピン留めを解除">✕</button>
+        </div>
+        <div class="pinned-card-effect">${this.escapeHtml(card.desc_ja)}</div>
+      `;
+
+      box.querySelector('.btn-pinned-focus').addEventListener('click', () => {
+        this.displayRecognitionResult({ card, score: 1, orientation: item.orientation || 'ピン参照' }, [{ card, score: 1 }]);
+      });
+      box.querySelector('.btn-pinned-remove').addEventListener('click', () => {
+        this.togglePinCard(card);
+      });
+
+      this.pinnedCardsList.appendChild(box);
+    });
+  }
+
   displayRecognitionResult(match, topCandidates, meta = null) {
     const { card, score, orientation } = match;
+    this.currentMatch = match;
+    this.currentCardId = card.id;
+
     // AI埋め込みのコサイン類似度（0〜1）を直感的なパーセント表示に変換
     const clampedScore = Math.max(0, Math.min(1, score));
     const percent = (clampedScore * 100).toFixed(1);
@@ -947,24 +1112,30 @@ class YgoRemoteLensApp {
     const badgeClass = isHighConfidence ? 'match-badge' : 'match-badge medium';
     const confidenceLabel = isHighConfidence ? '✅ 高信頼' : '⚠️ 候補確認推奨';
     const engineSuffix = meta
-      ? `<span class="engine-badge">${meta.engineLabel} / ${meta.elapsedSec}s</span>`
+      ? `<span class="engine-badge">${this.escapeHtml(meta.engineLabel)} / ${meta.elapsedSec}s</span>`
       : '';
 
     this.matchBadgeContainer.innerHTML = `<span class="${badgeClass}">${confidenceLabel} 類似度: ${percent}%</span>${engineSuffix}`;
 
     const imgSrc = card.image_full;
+    const pinned = this.isCardPinned(card.id);
 
     this.cardDetailContainer.innerHTML = `
       <div class="card-detail">
         <div class="card-top">
           <div class="card-image-box">
-            <img src="${imgSrc}" alt="${card.name_ja}" onerror="this.src='${card.image_crop}'" />
+            <img src="${this.escapeHtml(imgSrc)}" alt="${this.escapeHtml(card.name_ja)}" onerror="this.src='${this.escapeHtml(card.image_crop)}'" />
           </div>
           <div class="card-meta">
-            <div class="card-name-ja">${card.name_ja}</div>
-            <div class="card-name-en">${card.name_en} (ID: ${card.id})</div>
-            <div class="card-type-badge">${card.type_ja}</div>
-            <div class="card-stats">${card.stats_ja}</div>
+            <div class="card-name-ja">${this.escapeHtml(card.name_ja)}</div>
+            <div class="card-name-en">${this.escapeHtml(card.name_en)} (ID: ${card.id})</div>
+            <div class="card-type-badge">${this.escapeHtml(card.type_ja)}</div>
+            <div class="card-stats">${this.escapeHtml(card.stats_ja)}</div>
+            <div class="card-actions-row">
+              <button id="btnPinActiveCard" class="btn-pin-card ${pinned ? 'pinned' : ''}" title="このカードを下にピン留めして別カードと効果を見比べます">
+                ${pinned ? '📌 ピン留め中（クリックで解除）' : '📌 比較用にピン留め'}
+              </button>
+            </div>
           </div>
         </div>
         <div class="card-effect-box">
@@ -972,55 +1143,179 @@ class YgoRemoteLensApp {
             <span>📖 カード効果・テキスト</span>
             <span>ID: ${card.id}</span>
           </div>
-          <div class="card-effect-text">${card.desc_ja}</div>
+          <div class="card-effect-text">${this.escapeHtml(card.desc_ja)}</div>
         </div>
       </div>
     `;
 
-    this.candidatesSection.style.display = 'block';
-    this.candidatesList.innerHTML = '';
-    topCandidates.forEach((item, idx) => {
-      const p = (Math.max(0, Math.min(1, item.score)) * 100).toFixed(1);
-      const thumbSrc = item.card.image_crop;
-
-      const div = document.createElement('div');
-      div.className = `candidate-item ${item.card.id === card.id ? 'active' : ''}`;
-      div.innerHTML = `
-        <img src="${thumbSrc}" alt="${item.card.name_ja}" />
-        <div class="candidate-name">${item.card.name_ja}</div>
-        <div class="candidate-score">${idx + 1}位 (${p}%)</div>
-      `;
-      div.addEventListener('click', () => {
-        this.displayRecognitionResult(item, topCandidates, meta);
+    const pinBtn = document.getElementById('btnPinActiveCard');
+    if (pinBtn) {
+      pinBtn.addEventListener('click', () => {
+        this.togglePinCard(card, orientation);
       });
-      this.candidatesList.appendChild(div);
-    });
+    }
+
+    if (topCandidates && topCandidates.length > 1) {
+      this.candidatesSection.style.display = 'block';
+      this.candidatesList.innerHTML = '';
+      topCandidates.forEach((item, idx) => {
+        const p = (Math.max(0, Math.min(1, item.score)) * 100).toFixed(1);
+        const thumbSrc = item.card.image_crop;
+
+        const div = document.createElement('div');
+        div.className = `candidate-item ${item.card.id === card.id ? 'active' : ''}`;
+        div.innerHTML = `
+          <img src="${this.escapeHtml(thumbSrc)}" alt="${this.escapeHtml(item.card.name_ja)}" />
+          <div class="candidate-name">${this.escapeHtml(item.card.name_ja)}</div>
+          <div class="candidate-score">${idx + 1}位 (${p}%)</div>
+        `;
+        div.addEventListener('click', () => {
+          // 直前のAI認識で誤った1位を別候補へ修正したときは履歴も入れ替え
+          if (this.lastRecognizedCardId && this.lastRecognizedCardId !== item.card.id) {
+            const wrongIdx = this.history.findIndex((h) => h.card.id === this.lastRecognizedCardId);
+            if (wrongIdx === 0) {
+              if ((this.history[0].count || 1) <= 1) {
+                this.history.shift();
+              } else {
+                this.history[0].count -= 1;
+              }
+            }
+            this.lastRecognizedCardId = item.card.id;
+            this.addToHistory(item);
+          }
+          this.displayRecognitionResult(item, topCandidates, meta);
+        });
+        this.candidatesList.appendChild(div);
+      });
+    } else {
+      this.candidatesSection.style.display = 'none';
+      this.candidatesList.innerHTML = '';
+    }
+
+    this.renderPinnedCards();
+    this.renderHistory();
   }
 
   addToHistory(match) {
-    const timeStr = new Date().toLocaleTimeString('ja-JP');
-    this.history.unshift({ ...match, timeStr });
-    if (this.history.length > 30) this.history.pop();
+    if (!match || !match.card) return;
+    const timeStr = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const existingIdx = this.history.findIndex((h) => h.card.id === match.card.id);
 
-    this.historyCount.textContent = this.history.length;
-    this.historyList.innerHTML = '';
-
-    this.history.forEach((item) => {
-      const div = document.createElement('div');
-      div.className = 'history-item';
-      div.innerHTML = `
-        <img src="${item.card.image_crop}" alt="${item.card.name_ja}" />
-        <div class="history-meta">
-          <div class="history-name">${item.card.name_ja}</div>
-          <div class="history-sub">${item.timeStr} / ${item.orientation}</div>
-        </div>
-      `;
-      div.addEventListener('click', () => {
-        document.querySelector('[data-tab="detail"]').click();
-        this.displayRecognitionResult(item, [item]);
+    if (existingIdx !== -1) {
+      const existing = this.history.splice(existingIdx, 1)[0];
+      this.history.unshift({
+        ...match,
+        timeStr,
+        count: (existing.count || 1) + 1
       });
-      this.historyList.appendChild(div);
-    });
+    } else {
+      this.history.unshift({
+        ...match,
+        timeStr,
+        count: 1
+      });
+    }
+
+    if (this.history.length > 30) this.history.pop();
+    this.renderHistory();
+  }
+
+  clearHistory() {
+    this.history = [];
+    this.renderHistory();
+  }
+
+  renderHistory() {
+    if (!this.historyList || !this.historyCount) return;
+
+    const totalCount = this.history.length;
+    this.historyCount.textContent = totalCount;
+    if (this.quickHistoryCount) {
+      this.quickHistoryCount.textContent = totalCount;
+    }
+
+    const filtered = this.historyFilter
+      ? this.history.filter(
+          (item) =>
+            item.card.name_ja.toLowerCase().includes(this.historyFilter) ||
+            item.card.name_en.toLowerCase().includes(this.historyFilter)
+        )
+      : this.history;
+
+    this.historyList.innerHTML = '';
+    if (filtered.length === 0) {
+      const msg =
+        totalCount === 0
+          ? 'まだ認識されたカードはありません。<br />盤面をクリックするとここに追加されます。'
+          : '一致するカードがありません。';
+      this.historyList.innerHTML = `<div class="empty-state">${msg}</div>`;
+    } else {
+      filtered.forEach((item) => {
+        const isActive = item.card.id === this.currentCardId;
+        const isPinned = this.isCardPinned(item.card.id);
+        const countBadge = item.count > 1 ? `<span class="history-count-badge">×${item.count}</span>` : '';
+
+        const div = document.createElement('div');
+        div.className = `history-item ${isActive ? 'active' : ''}`;
+        div.innerHTML = `
+          <img src="${this.escapeHtml(item.card.image_crop)}" alt="${this.escapeHtml(item.card.name_ja)}" />
+          <div class="history-meta">
+            <div class="history-name-row">
+              <div class="history-name" title="${this.escapeHtml(item.card.name_ja)}">${this.escapeHtml(item.card.name_ja)}</div>
+              ${countBadge}
+            </div>
+            <div class="history-sub">${this.escapeHtml(item.timeStr)} / ${this.escapeHtml(item.orientation)}</div>
+          </div>
+          <button class="pin-mini-btn ${isPinned ? 'pinned' : ''}" title="${isPinned ? 'ピン留め解除' : '比較用にピン留め'}">📌</button>
+        `;
+
+        div.querySelector('.pin-mini-btn').addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.togglePinCard(item.card, item.orientation);
+        });
+
+        div.addEventListener('click', () => {
+          document.querySelector('[data-tab="detail"]').click();
+          this.displayRecognitionResult(item, [item]);
+        });
+
+        this.historyList.appendChild(div);
+      });
+    }
+
+    if (this.quickHistoryList) {
+      this.quickHistoryList.innerHTML = '';
+      if (this.history.length === 0) {
+        this.quickHistoryList.innerHTML =
+          '<span style="font-size: 0.74rem; color: var(--text-sub);">まだ履歴はありません</span>';
+      } else {
+        this.history.forEach((item) => {
+          const isActive = item.card.id === this.currentCardId;
+          const isPinned = this.isCardPinned(item.card.id);
+          const countBadge = item.count > 1 ? `<span class="history-count-badge">×${item.count}</span>` : '';
+
+          const chip = document.createElement('div');
+          chip.className = `quick-chip ${isActive ? 'active' : ''}`;
+          chip.innerHTML = `
+            <img src="${this.escapeHtml(item.card.image_crop)}" alt="${this.escapeHtml(item.card.name_ja)}" />
+            <span class="quick-chip-name">${this.escapeHtml(item.card.name_ja)}</span>
+            ${countBadge}
+            <button class="pin-mini-btn ${isPinned ? 'pinned' : ''}" title="${isPinned ? 'ピン留め解除' : '比較用にピン留め'}">📌</button>
+          `;
+
+          chip.querySelector('.pin-mini-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.togglePinCard(item.card, item.orientation);
+          });
+
+          chip.addEventListener('click', () => {
+            this.displayRecognitionResult(item, [item]);
+          });
+
+          this.quickHistoryList.appendChild(chip);
+        });
+      }
+    }
   }
 
   renderDBList() {
