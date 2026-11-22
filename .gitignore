@@ -20,4 +20,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.cache/
 node_modules/

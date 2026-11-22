@@ -15,7 +15,12 @@ const yieldToUI = () => new Promise((resolve) => setTimeout(resolve, 0));
 class YgoRemoteLensApp {
   constructor() {
     this.aiEngine = new window.YgoAIEngine();
+    this.siftServerBase = null;
+    this.useSiftServer = false;
+    this.browserAiInitialized = false;
     this.cardsDB = [];
+    this.dbMeanVec = null;
+    this.dinoMeanVec = null;
     this.history = [];
     this.pinnedCards = [];
     this.currentMatch = null;
@@ -28,6 +33,21 @@ class YgoRemoteLensApp {
 
     this.demoBoardCards = [];
 
+    // 定位置スキャンエリア＆自動監視状態
+    this.scanZone = null; // { x, y, w, h } in mainCanvas coords
+    this.isSettingScanZone = false;
+    this.autoScanEnabled = false;
+    this.lastAutoScanCardId = null;
+    this.scanZonePrevGray = null;
+    this.scanZoneDirty = false;
+    this.scanZoneStillTicks = 0;
+    this.scanZoneFlashUntil = 0;
+    this.scanZoneFlashLabel = '';
+    this.scanZoneProbeCanvas = document.createElement('canvas');
+    this.scanZoneProbeCanvas.width = 48;
+    this.scanZoneProbeCanvas.height = 48;
+    this.scanZoneProbeCtx = this.scanZoneProbeCanvas.getContext('2d', { willReadFrequently: true });
+
     this.isDragging = false;
     this.isRecognizing = false;
     this.isSwitchingEngine = false;
@@ -39,9 +59,11 @@ class YgoRemoteLensApp {
 
     this.initElements();
     this.initLayoutState();
+    this.loadSavedScanZone();
     this.bindEvents();
     this.refreshCameraList();
     this.initDatabase();
+    this.startAutoScanLoop();
   }
 
   initElements() {
@@ -63,6 +85,11 @@ class YgoRemoteLensApp {
     this.candidatesSection = document.getElementById('candidatesSection');
     this.candidatesList = document.getElementById('candidatesList');
 
+    this.btnSetScanZone = document.getElementById('btnSetScanZone');
+    this.btnToggleAutoScan = document.getElementById('btnToggleAutoScan');
+    this.btnClearScanZone = document.getElementById('btnClearScanZone');
+    this.scanZoneHint = document.getElementById('scanZoneHint');
+
     this.historyList = document.getElementById('historyList');
     this.historyCount = document.getElementById('historyCount');
     this.historyFilterInput = document.getElementById('historyFilterInput');
@@ -81,6 +108,62 @@ class YgoRemoteLensApp {
     this.dbCardList = document.getElementById('dbCardList');
     this.dbCount = document.getElementById('dbCount');
     this.btnClearAiCache = document.getElementById('btnClearAiCache');
+  }
+
+  loadSavedScanZone() {
+    try {
+      const raw = localStorage.getItem('ygo_remote_lens_scan_zone');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.w >= 24 && parsed.h >= 24) {
+          this.scanZone = parsed;
+        }
+      }
+    } catch (_) {
+      this.scanZone = null;
+    }
+    this.updateScanZoneUI();
+  }
+
+  saveScanZone() {
+    try {
+      if (this.scanZone) {
+        localStorage.setItem('ygo_remote_lens_scan_zone', JSON.stringify(this.scanZone));
+      } else {
+        localStorage.removeItem('ygo_remote_lens_scan_zone');
+      }
+    } catch (_) {
+      // 無視
+    }
+  }
+
+  updateScanZoneUI() {
+    if (this.btnSetScanZone) {
+      this.btnSetScanZone.classList.toggle('setting', this.isSettingScanZone);
+      this.btnSetScanZone.textContent = this.isSettingScanZone
+        ? '🟡 盤面をドラッグして枠を指定中...'
+        : this.scanZone
+        ? '🎯 スキャン枠を再設定'
+        : '🎯 定位置スキャン枠を設定';
+    }
+    if (this.btnToggleAutoScan) {
+      this.btnToggleAutoScan.classList.toggle('active', this.autoScanEnabled && Boolean(this.scanZone));
+      this.btnToggleAutoScan.textContent = this.autoScanEnabled ? '📡 自動認識: ON' : '📡 自動認識: OFF';
+    }
+    if (this.btnClearScanZone) {
+      this.btnClearScanZone.style.display = this.scanZone ? 'inline-flex' : 'none';
+    }
+    if (this.scanZoneHint) {
+      if (this.isSettingScanZone) {
+        this.scanZoneHint.textContent = 'カードを置く場所をマウスで四角く囲んでください';
+      } else if (this.autoScanEnabled && this.scanZone) {
+        this.scanZoneHint.textContent = '枠内にカードを置いて手を離すと自動認識します（クリック認識も併用可）';
+      } else if (this.scanZone) {
+        this.scanZoneHint.textContent = 'スキャン枠設定済み（「自動認識: ON」で監視開始）';
+      } else {
+        this.scanZoneHint.textContent = '盤面クリックでも随時認識できます';
+      }
+    }
   }
 
   initLayoutState() {
@@ -120,6 +203,42 @@ class YgoRemoteLensApp {
     document.getElementById('btnCaptureScreen').addEventListener('click', () => this.startScreenCapture());
     document.getElementById('btnStartCamera').addEventListener('click', () => this.startCamera());
     document.getElementById('fileInput').addEventListener('change', (e) => this.loadImageFile(e));
+
+    if (this.btnSetScanZone) {
+      this.btnSetScanZone.addEventListener('click', () => {
+        this.isSettingScanZone = !this.isSettingScanZone;
+        this.updateScanZoneUI();
+      });
+    }
+    if (this.btnToggleAutoScan) {
+      this.btnToggleAutoScan.addEventListener('click', () => {
+        if (!this.scanZone) {
+          this.isSettingScanZone = true;
+          this.updateScanZoneUI();
+          return;
+        }
+        this.autoScanEnabled = !this.autoScanEnabled;
+        this.scanZonePrevGray = null;
+        this.scanZoneDirty = false;
+        this.scanZoneStillTicks = 0;
+        this.lastAutoScanCardId = null;
+        this.updateScanZoneUI();
+        if (this.autoScanEnabled && this.mode === 'video' && this.video.readyState >= 2) {
+          this.recognizeRegion(this.scanZone, true, true);
+        }
+      });
+    }
+    if (this.btnClearScanZone) {
+      this.btnClearScanZone.addEventListener('click', () => {
+        this.scanZone = null;
+        this.autoScanEnabled = false;
+        this.isSettingScanZone = false;
+        this.lastAutoScanCardId = null;
+        this.scanZonePrevGray = null;
+        this.saveScanZone();
+        this.updateScanZoneUI();
+      });
+    }
 
     if (this.btnToggleHistoryRail) {
       this.btnToggleHistoryRail.addEventListener('click', () => {
@@ -234,7 +353,37 @@ class YgoRemoteLensApp {
   }
 
   /**
-   * 初期カードデータベースとAIエンジンの並列初期化
+   * Python OpenCV SIFT サーバーの稼働を自動検出
+   */
+  async checkSiftServer() {
+    const candidates =
+      window.location.protocol === 'http:' || window.location.protocol === 'https:'
+        ? ['', 'http://localhost:8000', 'http://127.0.0.1:8000']
+        : ['http://localhost:8000', 'http://127.0.0.1:8000'];
+
+    for (const base of candidates) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1400);
+        const res = await fetch(`${base}/api/health`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.ok && data.engine === 'opencv-sift') {
+            this.siftServerBase = base;
+            return data;
+          }
+        }
+      } catch (_) {
+        // 次の候補へ
+      }
+    }
+    this.siftServerBase = null;
+    return null;
+  }
+
+  /**
+   * 初期カードデータベースと認識エンジンの初期化（Python SIFTサーバーがあれば即座に接続・最速起動）
    */
   async initDatabase() {
     const initialCards = window.INITIAL_CARDS_DATA || [];
@@ -243,6 +392,7 @@ class YgoRemoteLensApp {
       const fallbackCanvas = this.createFallbackCardArt(card);
       return {
         ...card,
+        frameType: this.aiEngine.getCardFrameTypeFromMeta(card),
         safeCanvasElement: fallbackCanvas,
         thumbUrl: card.image_crop,
         feature: null,
@@ -257,14 +407,45 @@ class YgoRemoteLensApp {
     this.startDemoBoard();
     this.startRenderLoop();
 
-    this.setStatusBadge('🤖 AIモデル＆カード画像を取得中...', true);
+    this.setStatusBadge('🔍 認識エンジンを確認中...', true);
     if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
 
-    const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'mobilenet';
+    const siftHealth = await this.checkSiftServer();
+    if (siftHealth) {
+      this.useSiftServer = true;
+      if (this.aiEngineSelect) {
+        this.aiEngineSelect.value = 'sift';
+        this.aiEngineSelect.disabled = false;
+      }
+      this.cardsDB.forEach((c) => {
+        c.aiIndexed = true;
+        c.isFallback = false;
+      });
+      this.renderDBList();
+      this.setStatusBadge(
+        `✅ OpenCV SIFT 稼働中 (${siftHealth.card_count || this.cardsDB.length}枚・Python高精度)`,
+        false
+      );
+      this.matchStatusText.textContent =
+        'カメラを起動して定位置スキャン枠を設定するか、盤面のカードをクリックしてください';
+      return;
+    }
 
-    // AIモデル読み込みとカード実画像取得を並列で進める
+    // Pythonサーバー未起動時はブラウザ内AIモードへ自動フォールバック
+    this.useSiftServer = false;
+    if (this.aiEngineSelect && this.aiEngineSelect.value === 'sift') {
+      this.aiEngineSelect.value = 'hybrid';
+    }
+    const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'hybrid';
+    await this.initBrowserAI(preferredEngine);
+  }
+
+  async initBrowserAI(preferredEngine = 'hybrid') {
+    this.setStatusBadge('🤖 ブラウザAIモデル＆カード画像を取得中...', true);
+    if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
+
     let aiProgressText = 'AIモデル初期化中...';
-    let imgProgressText = `画像(0/${initialCards.length})`;
+    let imgProgressText = `画像(0/${this.cardsDB.length})`;
     const updateCombinedStatus = () => {
       this.setStatusBadge(`⏳ ${aiProgressText} | ${imgProgressText}`, true);
     };
@@ -281,17 +462,15 @@ class YgoRemoteLensApp {
 
     const [actualEngine] = await Promise.all([aiInitPromise, imageLoadPromise]);
 
-    // フォールバックが発生した場合はプルダウン表示も同期
     if (this.aiEngineSelect) {
-      if (actualEngine === 'dinov2' || actualEngine === 'mobilenet') {
+      if (actualEngine === 'hybrid' || actualEngine === 'dinov2' || actualEngine === 'mobilenet') {
         this.aiEngineSelect.value = actualEngine;
       }
       this.aiEngineSelect.disabled = false;
     }
 
-    // 全カードのAI特徴ベクトルを構築（IndexedDBキャッシュがあれば即座に完了）
     await this.rebuildAllCardEmbeddings(false);
-
+    this.browserAiInitialized = true;
     this.matchStatusText.textContent = '盤面のカードをクリックまたはドラッグで選択してください';
   }
 
@@ -359,9 +538,15 @@ class YgoRemoteLensApp {
       if (!cardEntry.isFallback) realCount++;
 
       try {
+        if (forceRecompute) {
+          cardEntry.dinoFeature = null;
+          cardEntry.dinoCenterFeature = null;
+          cardEntry.dinoTightFeature = null;
+        }
         if (forceRecompute || cardEntry.isFallback) {
           const W = cardEntry.safeCanvasElement.width;
           const H = cardEntry.safeCanvasElement.height;
+          const colorFeats = this.aiEngine.computeCardColorFeatures(cardEntry.safeCanvasElement);
           cardEntry.feature = await this.aiEngine.extractEmbedding(cardEntry.safeCanvasElement, 0, null, true);
           cardEntry.centerFeature = await this.aiEngine.extractEmbedding(
             cardEntry.safeCanvasElement,
@@ -375,11 +560,17 @@ class YgoRemoteLensApp {
             { x: W * 0.15, y: H * 0.15, w: W * 0.70, h: H * 0.70 },
             true
           );
+          cardEntry.colorFeature = colorFeats.colorFeature;
+          cardEntry.centerColorFeature = colorFeats.centerColorFeature;
+          cardEntry.tightColorFeature = colorFeats.tightColorFeature;
         } else {
           const emb = await this.aiEngine.getOrComputeCardEmbeddings(cardEntry.id, cardEntry.safeCanvasElement);
           cardEntry.feature = emb.feature;
           cardEntry.centerFeature = emb.centerFeature;
           cardEntry.tightFeature = emb.tightFeature;
+          cardEntry.colorFeature = emb.colorFeature;
+          cardEntry.centerColorFeature = emb.centerColorFeature;
+          cardEntry.tightColorFeature = emb.tightColorFeature;
           if (emb.fromCache) cacheHits++;
         }
         cardEntry.aiIndexed = true;
@@ -397,18 +588,130 @@ class YgoRemoteLensApp {
       }
     }
 
+    this.recomputeHubnessStats(false);
+
     this.setStatusBadge(
-      `✅ AI認識稼働中 [${engineLabel}] (${total}枚 / 実画像:${realCount}枚)`,
+      `✅ AI認識稼働中 [${this.aiEngine.getEngineLabel()}] (${total}枚 / 実画像:${realCount}枚)`,
       false
     );
     this.renderDBList();
 
     if (this.aiEngineSelect) this.aiEngineSelect.disabled = false;
     this.isSwitchingEngine = false;
+
+    if (this.aiEngine.activeEngine === 'hybrid') {
+      this.warmUpHybridDinoInBackground();
+    }
   }
 
   /**
-   * AIエンジンを動的に切り替え（DINOv2-small <-> MobileNet v2）
+   * ハブ現象（特定カードが何に対しても高スコアで割り込む現象）を数学的に解消するため、
+   * 全カード平均ベクトルの減算（Mean-Centering）と各カードのCSLSハブ基準値を事前算出（約5ms）
+   */
+  recomputeHubnessStats(useDino = false) {
+    const validCards = this.cardsDB.filter((c) => (useDino ? c.dinoFeature : c.feature));
+    if (validCards.length < 4) {
+      if (useDino) this.dinoMeanVec = null;
+      else this.dbMeanVec = null;
+      return;
+    }
+
+    const baseVecs = validCards.map((c) => (useDino ? c.dinoFeature : c.feature));
+    const meanVec = this.aiEngine.computeMeanVector(baseVecs);
+    if (useDino) {
+      this.dinoMeanVec = meanVec;
+    } else {
+      this.dbMeanVec = meanVec;
+    }
+
+    for (const c of validCards) {
+      if (useDino) {
+        c.cDinoFeature = this.aiEngine.centerAndNormalize(c.dinoFeature, meanVec);
+        c.cDinoCenterFeature = this.aiEngine.centerAndNormalize(c.dinoCenterFeature, meanVec);
+        c.cDinoTightFeature = this.aiEngine.centerAndNormalize(c.dinoTightFeature, meanVec);
+      } else {
+        c.cFeature = this.aiEngine.centerAndNormalize(c.feature, meanVec);
+        c.cCenterFeature = this.aiEngine.centerAndNormalize(c.centerFeature, meanVec);
+        c.cTightFeature = this.aiEngine.centerAndNormalize(c.tightFeature, meanVec);
+      }
+    }
+
+    // CSLS: 各カードの「他のカード上位K枚に対する平均類似度（ハブ度）」を算出
+    const K = Math.min(10, validCards.length - 1);
+    const n = validCards.length;
+    const centeredList = validCards.map((c) => (useDino ? c.cDinoFeature : c.cFeature));
+
+    for (let i = 0; i < n; i++) {
+      const sims = [];
+      const vi = centeredList[i];
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        sims.push(this.aiEngine.cosineSimilarity(vi, centeredList[j]));
+      }
+      sims.sort((a, b) => b - a);
+      let sum = 0;
+      for (let k = 0; k < K; k++) {
+        sum += sims[k];
+      }
+      const hubBias = sum / K;
+      if (useDino) {
+        validCards[i].dinoHubBias = hubBias;
+      } else {
+        validCards[i].hubBias = hubBias;
+      }
+    }
+  }
+
+  /**
+   * ハイブリッドモード時、アイドル時間を使ってバックグラウンドでDINOv2モデルと全カードの特徴をIndexedDBへ準備
+   */
+  async warmUpHybridDinoInBackground() {
+    if (this._warmingUpDino) return;
+    this._warmingUpDino = true;
+    try {
+      const ok = await this.aiEngine.ensureDinoLoaded();
+      if (!ok || this.aiEngine.activeEngine !== 'hybrid') return;
+
+      const total = this.cardsDB.length;
+      const realCount = this.cardsDB.filter((c) => !c.isFallback).length;
+      this.setStatusBadge(
+        `✅ AI認識稼働中 [${this.aiEngine.getEngineLabel()}] (${total}枚 / 実画像:${realCount}枚)`,
+        false
+      );
+
+      for (let i = 0; i < this.cardsDB.length; i++) {
+        if (this.aiEngine.activeEngine !== 'hybrid') break;
+        while (this.isRecognizing || this.isSwitchingEngine) {
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        const cardEntry = this.cardsDB[i];
+        if (!cardEntry.isFallback && !cardEntry.dinoFeature) {
+          try {
+            const emb = await this.aiEngine.getOrComputeCardEmbeddings(
+              cardEntry.id,
+              cardEntry.safeCanvasElement,
+              'dinov2'
+            );
+            cardEntry.dinoFeature = emb.feature;
+            cardEntry.dinoCenterFeature = emb.centerFeature;
+            cardEntry.dinoTightFeature = emb.tightFeature;
+          } catch (_) {
+            // 個別エラーは無視
+          }
+          await yieldToUI();
+        }
+      }
+
+      if (this.aiEngine.activeEngine === 'hybrid') {
+        this.recomputeHubnessStats(true);
+      }
+    } finally {
+      this._warmingUpDino = false;
+    }
+  }
+
+  /**
+   * 認識エンジンを動的に切り替え（OpenCV SIFT / Hybrid / DINOv2-small / MobileNet v2）
    */
   async switchAIEngine(engineId) {
     if (this.isSwitchingEngine || this.isRecognizing) return;
@@ -416,12 +719,40 @@ class YgoRemoteLensApp {
     if (this.aiEngineSelect) this.aiEngineSelect.disabled = true;
 
     try {
+      if (engineId === 'sift') {
+        this.setStatusBadge('🔄 OpenCV SIFT サーバーに接続中...', true);
+        const health = await this.checkSiftServer();
+        if (health) {
+          this.useSiftServer = true;
+          this.setStatusBadge(
+            `✅ OpenCV SIFT 稼働中 (${health.card_count || this.cardsDB.length}枚・Python高精度)`,
+            false
+          );
+          if (this.aiEngineSelect) this.aiEngineSelect.value = 'sift';
+        } else {
+          alert('Python OpenCV SIFT サーバー（http://localhost:8000）が見つかりません。\n./start_server.sh を起動してから選択してください。');
+          this.useSiftServer = false;
+          if (this.aiEngineSelect) this.aiEngineSelect.value = this.aiEngine.activeEngine || 'hybrid';
+        }
+        return;
+      }
+
+      this.useSiftServer = false;
+      if (!this.browserAiInitialized) {
+        this.isSwitchingEngine = false;
+        await this.initBrowserAI(engineId);
+        return;
+      }
+
       this.setStatusBadge(`🔄 AIエンジン切替中 (${engineId})...`, true);
       const actualEngine = await this.aiEngine.init(engineId, (msg) => {
         this.setStatusBadge(`🔄 ${msg}`, true);
       });
 
-      if (this.aiEngineSelect && (actualEngine === 'dinov2' || actualEngine === 'mobilenet')) {
+      if (
+        this.aiEngineSelect &&
+        (actualEngine === 'hybrid' || actualEngine === 'dinov2' || actualEngine === 'mobilenet')
+      ) {
         this.aiEngineSelect.value = actualEngine;
       }
 
@@ -581,8 +912,8 @@ class YgoRemoteLensApp {
       this.stopVideoStream();
       const selectedDeviceId = this.cameraDeviceSelect ? this.cameraDeviceSelect.value : '';
       const videoConstraints = {
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
       };
       if (selectedDeviceId) {
         videoConstraints.deviceId = { exact: selectedDeviceId };
@@ -656,14 +987,37 @@ class YgoRemoteLensApp {
       this.drawMediaContain(ctx, this.loadedImage, this.loadedImage.width, this.loadedImage.height, W, H);
     }
 
+    // 定位置スキャン枠の描画（常に視覚的に把握可能）
+    if (this.scanZone && !this.isSettingScanZone) {
+      const isFlashing = performance.now() < this.scanZoneFlashUntil;
+      const zoneColor = isFlashing
+        ? '#34d399'
+        : this.autoScanEnabled
+        ? '#38bdf8'
+        : 'rgba(148, 163, 184, 0.75)';
+      const zoneLabel = isFlashing
+        ? this.scanZoneFlashLabel
+        : this.autoScanEnabled
+        ? '📡 自動スキャン監視中'
+        : '📡 定位置スキャン枠 (停止中)';
+      ctx.save();
+      ctx.setLineDash([8, 5]);
+      this.drawSelectionOverlay(ctx, this.scanZone, zoneColor, zoneLabel);
+      ctx.restore();
+    }
+
     if (this.isDragging) {
       const rect = this.getNormalizedDragRect();
-      this.drawSelectionOverlay(ctx, rect, '#38bdf8', 'イラスト部分を四角く囲んでください...');
+      const dragColor = this.isSettingScanZone ? '#fbbf24' : '#38bdf8';
+      const dragLabel = this.isSettingScanZone
+        ? '📡 ここに定位置スキャン枠を設定します...'
+        : 'カードを四角く囲んでください...';
+      this.drawSelectionOverlay(ctx, rect, dragColor, dragLabel);
     } else {
-      if (this.lastSelectionBox) {
+      if (this.lastSelectionBox && this.lastSelectionBox !== this.scanZone) {
         this.drawSelectionOverlay(ctx, this.lastSelectionBox, 'rgba(251, 191, 36, 0.55)', '選択範囲');
       }
-      if (this.bestMatchedSubBox) {
+      if (this.bestMatchedSubBox && this.bestMatchedSubBox !== this.scanZone) {
         this.drawSelectionOverlay(ctx, this.bestMatchedSubBox, '#10b981', '🎯 AI認識エリア');
       }
     }
@@ -779,6 +1133,27 @@ class YgoRemoteLensApp {
     const dy = Math.abs(this.dragCurrent.y - this.dragStart.y);
 
     const isDrag = dx >= 12 || dy >= 12;
+
+    // 定位置スキャン枠の設定モード中なら、ドラッグ範囲をスキャン枠として保存＆自動認識ON
+    if (this.isSettingScanZone) {
+      this.isSettingScanZone = false;
+      if (isDrag) {
+        this.scanZone = this.getNormalizedDragRect();
+        this.autoScanEnabled = true;
+        this.lastAutoScanCardId = null;
+        this.scanZonePrevGray = null;
+        this.scanZoneDirty = false;
+        this.scanZoneStillTicks = 0;
+        this.saveScanZone();
+        this.updateScanZoneUI();
+        // 設定直後に1回スキャン実行
+        this.recognizeRegion(this.scanZone, true, true);
+      } else {
+        this.updateScanZoneUI();
+      }
+      return;
+    }
+
     this.lastClickWasDemoCard = false;
     this.lastSelectionWasDrag = isDrag;
     let targetBox;
@@ -789,7 +1164,7 @@ class YgoRemoteLensApp {
     }
 
     this.lastSelectionBox = targetBox;
-    this.recognizeRegion(targetBox, isDrag);
+    this.recognizeRegion(targetBox, isDrag, false);
   }
 
   determineClickCropBox(clickX, clickY) {
@@ -813,10 +1188,13 @@ class YgoRemoteLensApp {
       }
     }
 
-    const size = parseInt(this.cropSizeSelect.value, 10) || 130;
-    const x = Math.max(0, Math.min(this.mainCanvas.width - size, clickX - size / 2));
-    const y = Math.max(0, Math.min(this.mainCanvas.height - size, clickY - size / 2));
-    return { x, y, w: size, h: size };
+    const size = parseInt(this.cropSizeSelect.value, 10) || 85;
+    // OpenCV SIFTモードではカード全体（枠・星・イラスト）が入った方が一致点が倍増するため広めに切り抜く
+    const boxW = this.useSiftServer ? Math.round(size * 1.6) : size;
+    const boxH = this.useSiftServer ? Math.round(size * 2.0) : size;
+    const x = Math.max(0, Math.min(this.mainCanvas.width - boxW, clickX - boxW / 2));
+    const y = Math.max(0, Math.min(this.mainCanvas.height - boxH, clickY - boxH / 2));
+    return { x, y, w: boxW, h: boxH };
   }
 
   getNormalizedDragRect() {
@@ -836,12 +1214,12 @@ class YgoRemoteLensApp {
     const W = this.mainCanvas.width;
     const H = this.mainCanvas.height;
 
-    const addWin = (x, y, w, h) => {
+    const addWin = (x, y, w, h, uprightOnly = false) => {
       const cw = Math.max(24, Math.min(W, w));
       const ch = Math.max(24, Math.min(H, h));
       const cx = Math.max(0, Math.min(W - cw, x));
       const cy = Math.max(0, Math.min(H - ch, y));
-      windows.push({ x: cx, y: cy, w: cw, h: ch });
+      windows.push({ x: cx, y: cy, w: cw, h: ch, uprightOnly });
     };
 
     // デモ盤面のカードクリック時は正確なイラスト領域が確定しているため1枠のみ（4方向=4推論で最速）
@@ -874,11 +1252,18 @@ class YgoRemoteLensApp {
         addWin(centerX - innerSide / 2, centerY - innerSide / 2, innerSide, innerSide);
       }
     } else {
-      // ワンクリック時：標準(100%) + 小(76%) + 大(128%) の3スケールでカバー
-      const scales = [1.0, 0.76, 1.28];
+      // ワンクリック時：標準(100%) + 小(78%) + 大(124%) の3スケール
+      const scales = [1.0, 0.78, 1.24];
       for (const s of scales) {
         const side = baseSide * s;
-        addWin(centerX - side / 2, centerY - side / 2, side, side);
+        addWin(centerX - side / 2, centerY - side / 2, side, side, false);
+      }
+      // カード中央をクリックした際にテキスト欄が混ざるのを防ぐ上下シフト枠（高速なMobileNet/Hybrid時に有効化）
+      if (this.aiEngine.activeEngine !== 'dinov2') {
+        const shiftSide = baseSide * 0.92;
+        const offset = baseSide * 0.22;
+        addWin(centerX - shiftSide / 2, centerY - offset - shiftSide / 2, shiftSide, shiftSide, true);
+        addWin(centerX - shiftSide / 2, centerY + offset - shiftSide / 2, shiftSide, shiftSide, true);
       }
     }
 
@@ -886,14 +1271,369 @@ class YgoRemoteLensApp {
   }
 
   /**
-   * 選択領域をブラウザ内AIで非同期認識
+   * 1枚のカード（3種クロップ）とクエリ特徴（Mean-Centering済みAIベクトル＋空間カラー特徴＋カード枠色判定）の統合スコアを計算
+   * 戻り値: { rankScore: 順位付け用の高精度スコア, rawSim: 画面表示用の直感的な一致率(0..1) }
    */
-  async recognizeRegion(box, isDragBox = false) {
+  scoreCardAgainstQuery(card, q, useDinoFeatures = false, aiWeight = 0.86, colorWeight = 0.14, applySidewaysGuard = true) {
+    const useCentered = useDinoFeatures
+      ? Boolean(this.dinoMeanVec && card.cDinoFeature && q.centeredVec)
+      : Boolean(this.dbMeanVec && card.cFeature && q.centeredVec);
+
+    const qVec = useCentered ? q.centeredVec : q.vec;
+    const fFull = useDinoFeatures
+      ? (useCentered ? card.cDinoFeature : card.dinoFeature)
+      : (useCentered ? card.cFeature : card.feature);
+    const fCenter = useDinoFeatures
+      ? (useCentered ? card.cDinoCenterFeature : card.dinoCenterFeature)
+      : (useCentered ? card.cCenterFeature : card.centerFeature);
+    const fTight = useDinoFeatures
+      ? (useCentered ? card.cDinoTightFeature : card.dinoTightFeature)
+      : (useCentered ? card.cTightFeature : card.tightFeature);
+    if (!fFull || !qVec) return { rankScore: -1, rawSim: 0 };
+
+    const rawFull = useDinoFeatures ? card.dinoFeature : card.feature;
+    const rawCenter = useDinoFeatures ? card.dinoCenterFeature : card.centerFeature;
+    const rawTight = useDinoFeatures ? card.dinoTightFeature : card.tightFeature;
+
+    const calcCropScore = (aiVec, cardColorVec) => {
+      if (!aiVec) return -1;
+      const aiSim = this.aiEngine.cosineSimilarity(qVec, aiVec);
+      if (q.colorVec && cardColorVec) {
+        const colorSim = this.aiEngine.cosineSimilarity(q.colorVec, cardColorVec);
+        return aiSim * aiWeight + colorSim * colorWeight;
+      }
+      return aiSim;
+    };
+
+    const sFull = calcCropScore(fFull, card.colorFeature);
+    const sCenter = calcCropScore(fCenter, card.centerColorFeature);
+    const sTight = calcCropScore(fTight, card.tightColorFeature);
+
+    // 単一クロップの偶然一致（外れ値）を抑えるため、1位クロップ(82%) + 2位クロップ(18%) のコンセンサススコアを採用
+    const arr = [sFull, sCenter, sTight].sort((a, b) => b - a);
+    let rankScore = arr[1] > -0.5 ? arr[0] * 0.82 + arr[1] * 0.18 : arr[0];
+
+    // 画面表示用の素のコサイン類似度（直感的な%表示用）
+    const rFull = rawFull ? this.aiEngine.cosineSimilarity(q.vec, rawFull) : 0;
+    const rCenter = rawCenter ? this.aiEngine.cosineSimilarity(q.vec, rawCenter) : 0;
+    const rTight = rawTight ? this.aiEngine.cosineSimilarity(q.vec, rawTight) : 0;
+    let rawSim = Math.max(rFull, rCenter, rTight);
+
+    // CSLS ハブ現象補正（他カード全般と似やすいハブカードの底上げ分を減算）
+    if (useCentered) {
+      const hubBias = useDinoFeatures ? (card.dinoHubBias || 0) : (card.hubBias || 0);
+      const hubPenaltyWeight = useDinoFeatures ? 0.40 : 0.45;
+      rankScore -= hubBias * hubPenaltyWeight;
+    }
+
+    // カード枠色判定によるボーナス・ペナルティ（黒枠X vs 青枠L などの別種別誤爆を強力に抑止）
+    const frameInfo = q.frameInfo;
+    if (
+      frameInfo &&
+      frameInfo.frameType !== 'unknown' &&
+      frameInfo.confidence >= 0.42 &&
+      card.frameType &&
+      card.frameType !== 'unknown'
+    ) {
+      if (card.frameType === frameInfo.frameType) {
+        rankScore += 0.095 * frameInfo.confidence;
+        rawSim = Math.min(0.99, rawSim + 0.04 * frameInfo.confidence);
+      } else {
+        rankScore -= 0.075 * frameInfo.confidence;
+        rawSim = Math.max(0, rawSim - 0.05 * frameInfo.confidence);
+      }
+    }
+
+    // 横向き（90°/270°）への偶然誤爆ガード（本当に横向きのカードなら大差で勝つため影響せず、縦カードの誤爆だけ防ぐ）
+    if (applySidewaysGuard && (q.deg === 90 || q.deg === 270)) {
+      rankScore -= 0.018;
+    }
+
+    return { rankScore, rawSim };
+  }
+
+  /**
+   * 現在の表示ソースから劣化のない最高解像度スナップショットを取得し、
+   * mainCanvas座標（960x580）→ 元映像/元画像座標への変換関数を返す
+   */
+  captureHighResSnapshot() {
+    const dstW = this.mainCanvas.width;
+    const dstH = this.mainCanvas.height;
+
+    const buildContainMapper = (srcW, srcH, snapW, snapH) => {
+      const displayScale = Math.min(dstW / srcW, dstH / srcH);
+      const dispW = srcW * displayScale;
+      const dispH = srcH * displayScale;
+      const offsetX = (dstW - dispW) / 2;
+      const offsetY = (dstH - dispH) / 2;
+      const snapRatioX = snapW / srcW;
+      const snapRatioY = snapH / srcH;
+
+      return (rect) => {
+        const rawX = ((rect.x - offsetX) / displayScale) * snapRatioX;
+        const rawY = ((rect.y - offsetY) / displayScale) * snapRatioY;
+        const rawW = (rect.w / displayScale) * snapRatioX;
+        const rawH = (rect.h / displayScale) * snapRatioY;
+
+        const w = Math.max(16, Math.min(snapW, rawW));
+        const h = Math.max(16, Math.min(snapH, rawH));
+        const x = Math.max(0, Math.min(snapW - w, rawX));
+        const y = Math.max(0, Math.min(snapH - h, rawY));
+        return { x, y, w, h };
+      };
+    };
+
+    // 1) Webカメラ / Discord画面キャプチャ：縮小前のネイティブ解像度videoフレームから直接切り抜く
+    if (this.mode === 'video' && this.video.readyState >= 2 && this.video.videoWidth > 0 && this.video.videoHeight > 0) {
+      const srcW = this.video.videoWidth;
+      const srcH = this.video.videoHeight;
+      const snap = document.createElement('canvas');
+      snap.width = srcW;
+      snap.height = srcH;
+      snap.getContext('2d').drawImage(this.video, 0, 0, srcW, srcH);
+      return {
+        snapshotCanvas: snap,
+        mapBoxToSnapshot: buildContainMapper(srcW, srcH, srcW, srcH)
+      };
+    }
+
+    // 2) 画像ファイル読込：元画像のネイティブ解像度（最大2560px）から直接切り抜く
+    if (this.mode === 'image' && this.loadedImage && this.loadedImage.width > 0 && this.loadedImage.height > 0) {
+      const srcW = this.loadedImage.width;
+      const srcH = this.loadedImage.height;
+      const maxDim = 2560;
+      const capScale = Math.min(1, maxDim / Math.max(srcW, srcH));
+      const snapW = Math.max(1, Math.round(srcW * capScale));
+      const snapH = Math.max(1, Math.round(srcH * capScale));
+      const snap = document.createElement('canvas');
+      snap.width = snapW;
+      snap.height = snapH;
+      snap.getContext('2d').drawImage(this.loadedImage, 0, 0, snapW, snapH);
+      return {
+        snapshotCanvas: snap,
+        mapBoxToSnapshot: buildContainMapper(srcW, srcH, snapW, snapH)
+      };
+    }
+
+    // 3) デモ盤面モード：オーバーレイ抜きのmainCanvasからスナップショット
+    this.lastSelectionBox = null;
+    this.bestMatchedSubBox = null;
+    this.drawFrame();
+
+    const snap = document.createElement('canvas');
+    snap.width = dstW;
+    snap.height = dstH;
+    snap.getContext('2d').drawImage(this.mainCanvas, 0, 0);
+    return {
+      snapshotCanvas: snap,
+      mapBoxToSnapshot: (rect) => rect
+    };
+  }
+
+  /**
+   * 定位置スキャンエリアの常時監視ループ（350ms間隔・動きを検知して静止した瞬間に自動認識）
+   */
+  startAutoScanLoop() {
+    if (this._autoScanTimer) clearInterval(this._autoScanTimer);
+    this._autoScanTimer = setInterval(() => {
+      this.tickAutoScan();
+    }, 350);
+  }
+
+  tickAutoScan() {
+    if (
+      !this.autoScanEnabled ||
+      !this.scanZone ||
+      this.mode !== 'video' ||
+      this.video.readyState < 2 ||
+      this.isRecognizing ||
+      this.isSwitchingEngine ||
+      this.isDragging ||
+      this.isSettingScanZone
+    ) {
+      return;
+    }
+
+    const srcW = this.video.videoWidth;
+    const srcH = this.video.videoHeight;
+    if (!srcW || !srcH) return;
+
+    const dstW = this.mainCanvas.width;
+    const dstH = this.mainCanvas.height;
+    const displayScale = Math.min(dstW / srcW, dstH / srcH);
+    const offsetX = (dstW - srcW * displayScale) / 2;
+    const offsetY = (dstH - srcH * displayScale) / 2;
+
+    const sx = Math.max(0, Math.min(srcW - 16, (this.scanZone.x - offsetX) / displayScale));
+    const sy = Math.max(0, Math.min(srcH - 16, (this.scanZone.y - offsetY) / displayScale));
+    const sw = Math.max(16, Math.min(srcW - sx, this.scanZone.w / displayScale));
+    const sh = Math.max(16, Math.min(srcH - sy, this.scanZone.h / displayScale));
+
+    const ctx = this.scanZoneProbeCtx;
+    ctx.drawImage(this.video, sx, sy, sw, sh, 0, 0, 48, 48);
+    const data = ctx.getImageData(0, 0, 48, 48).data;
+    const gray = new Uint8Array(48 * 48);
+    for (let i = 0; i < gray.length; i++) {
+      gray[i] = Math.round(0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]);
+    }
+
+    if (!this.scanZonePrevGray) {
+      this.scanZonePrevGray = gray;
+      return;
+    }
+
+    let diffSum = 0;
+    for (let i = 0; i < gray.length; i++) {
+      diffSum += Math.abs(gray[i] - this.scanZonePrevGray[i]);
+    }
+    const meanDiff = diffSum / gray.length;
+    this.scanZonePrevGray = gray;
+
+    if (meanDiff > 7.5) {
+      // 手やカードが動いている間は待機フラグを立てる
+      this.scanZoneDirty = true;
+      this.scanZoneStillTicks = 0;
+    } else if (this.scanZoneDirty && meanDiff < 4.5) {
+      this.scanZoneStillTicks++;
+      // 約0.7秒静止したら（手が離れたら）自動で認識実行
+      if (this.scanZoneStillTicks >= 2) {
+        this.scanZoneDirty = false;
+        this.scanZoneStillTicks = 0;
+        this.recognizeRegion(this.scanZone, true, true);
+      }
+    }
+  }
+
+  /**
+   * Python OpenCV SIFT + RANSAC サーバーで高速・超高精度認識
+   */
+  async recognizeWithSiftServer(snapshotCanvas, srcRect, displayBox, isAutoScan = false) {
+    const startTime = performance.now();
+
+    const cropCanvas = document.createElement('canvas');
+    const outW = Math.max(32, Math.round(srcRect.w));
+    const outH = Math.max(32, Math.round(srcRect.h));
+    cropCanvas.width = outW;
+    cropCanvas.height = outH;
+    cropCanvas.getContext('2d').drawImage(snapshotCanvas, srcRect.x, srcRect.y, srcRect.w, srcRect.h, 0, 0, outW, outH);
+
+    if (!isAutoScan) {
+      this.matchStatusText.textContent = '⚡ OpenCV SIFT サーバーで解析中...';
+      this.matchBadgeContainer.innerHTML = `<span class="match-badge processing">OpenCV SIFT + RANSAC で照合中</span>`;
+    }
+
+    const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.9));
+    const formData = new FormData();
+    formData.append('file', blob, 'crop.jpg');
+    formData.append('mode', 'auto');
+
+    const res = await fetch(`${this.siftServerBase}/api/recognize`, {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) {
+      throw new Error(`SIFTサーバーエラー (${res.status})`);
+    }
+    const data = await res.json();
+    if (!data.ok) {
+      throw new Error(data.error || 'SIFT認識に失敗しました');
+    }
+
+    // 自動スキャン時は、カードが置かれていない（一致特徴点が足りない）フレームを静かにスキップ
+    if (isAutoScan && !data.recognized) {
+      this.lastAutoScanCardId = null;
+      return;
+    }
+
+    const mapped = (data.matches || [])
+      .map((m) => {
+        const card = this.cardsDB.find((c) => c.id === m.id);
+        if (!card) return null;
+        return {
+          card,
+          score: m.score,
+          displayScore: m.score,
+          inliers: m.inliers,
+          orientation: isAutoScan ? `自動スキャン (一致点:${m.inliers})` : `SIFT全方向対応 (一致点:${m.inliers})`,
+          deg: 0,
+          matchedBox: displayBox
+        };
+      })
+      .filter(Boolean);
+
+    if (mapped.length === 0) {
+      if (!isAutoScan) {
+        this.matchStatusText.textContent = '⚠️ 一致するカードが見つかりませんでした';
+        this.matchBadgeContainer.innerHTML = '';
+      }
+      return;
+    }
+
+    const topMatch = mapped[0];
+    // 自動スキャンで直前とまったく同じカードが置かれたままなら履歴を重複更新しない
+    if (isAutoScan && this.lastAutoScanCardId === topMatch.card.id) {
+      return;
+    }
+    if (isAutoScan) {
+      this.lastAutoScanCardId = topMatch.card.id;
+      this.scanZoneFlashUntil = performance.now() + 2200;
+      this.scanZoneFlashLabel = `✅ ${topMatch.card.name_ja}`;
+    }
+
+    // プレビュー表示更新
+    this.cropPreviewCtx.clearRect(0, 0, 64, 64);
+    this.cropPreviewCtx.drawImage(cropCanvas, 0, 0, 64, 64);
+
+    if (!isAutoScan) {
+      this.lastSelectionBox = displayBox;
+      this.bestMatchedSubBox = displayBox;
+    }
+
+    const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
+    const secondMatch = mapped[1];
+    const margin = secondMatch ? topMatch.score - secondMatch.score : 1;
+
+    const meta = {
+      elapsedSec,
+      margin: data.recognized ? Math.max(margin, 0.1) : 0,
+      engineLabel: `OpenCV SIFT (${topMatch.inliers}pt)`,
+      frameLabel: ''
+    };
+
+    this.lastRecognizedCardId = topMatch.card.id;
+    this.addToHistory(topMatch);
+    this.displayRecognitionResult(topMatch, mapped.slice(0, 5), meta);
+  }
+
+  /**
+   * 選択領域を認識（OpenCV SIFTサーバー優先、未接続時はブラウザ内AIへフォールバック）
+   */
+  async recognizeRegion(box, isDragBox = false, isAutoScan = false) {
     if (this.isRecognizing || this.isSwitchingEngine) return;
+
+    if (this.useSiftServer && this.siftServerBase !== null) {
+      this.isRecognizing = true;
+      try {
+        const { snapshotCanvas, mapBoxToSnapshot } = this.captureHighResSnapshot();
+        const srcRect = mapBoxToSnapshot(box);
+        await this.recognizeWithSiftServer(snapshotCanvas, srcRect, box, isAutoScan);
+      } catch (err) {
+        console.error('SIFT recognition error:', err);
+        if (!isAutoScan) {
+          this.matchStatusText.textContent = '⚠️ SIFT認識エラー: ' + err.message;
+          this.matchBadgeContainer.innerHTML = '';
+        }
+      } finally {
+        this.isRecognizing = false;
+      }
+      return;
+    }
 
     const indexedCards = this.cardsDB.filter((c) => c.feature);
     if (!this.aiEngine.isReady || indexedCards.length === 0) {
-      this.matchStatusText.textContent = '⏳ AIモデルとカードDBの準備完了をお待ちください...';
+      if (!isAutoScan) {
+        this.matchStatusText.textContent = '⏳ AIモデルとカードDBの準備完了をお待ちください...';
+      }
       return;
     }
 
@@ -901,87 +1641,219 @@ class YgoRemoteLensApp {
     const startTime = performance.now();
 
     try {
-      // 1) 選択枠オーバーレイを含まないクリーンな現在フレームをオフスクリーンにスナップショット
-      this.lastSelectionBox = null;
-      this.bestMatchedSubBox = null;
-      this.drawFrame();
-
-      const snapshotCanvas = document.createElement('canvas');
-      snapshotCanvas.width = this.mainCanvas.width;
-      snapshotCanvas.height = this.mainCanvas.height;
-      snapshotCanvas.getContext('2d').drawImage(this.mainCanvas, 0, 0);
+      // 1) 縮小前の元映像・元画像から劣化のない高解像度フレームをスナップショット
+      const { snapshotCanvas, mapBoxToSnapshot } = this.captureHighResSnapshot();
 
       // 選択枠を即座に戻して視覚フィードバックを維持
-      this.lastSelectionBox = box;
+      if (!isAutoScan) {
+        this.lastSelectionBox = box;
+        this.bestMatchedSubBox = null;
+      }
 
       const enhanceLighting = this.enhanceLightingCheck ? this.enhanceLightingCheck.checked : true;
       const searchWindows = this.generateAISearchWindows(box, isDragBox);
-      const orientations = [
+      const allOrientations = [
         { deg: 0, label: '正位置 (0°)' },
         { deg: 180, label: '相手視点・逆さま (180°)' },
         { deg: 90, label: '横向き・守備 (90°)' },
         { deg: 270, label: '横向き・守備 (270°)' }
       ];
+      const uprightOrientations = allOrientations.slice(0, 2);
 
-      const totalSteps = searchWindows.length * orientations.length;
+      const isHybrid = this.aiEngine.activeEngine === 'hybrid';
+      const stage1Engine = isHybrid ? 'mobilenet' : this.aiEngine.activeEngine;
+      const stage1AiWeight = stage1Engine === 'dinov2' ? 0.90 : 0.86;
+      const stage1ColorWeight = 1 - stage1AiWeight;
+      const applySidewaysGuard = !(isDragBox && box.w > box.h * 1.15);
+
+      const queryPlan = [];
+      for (const win of searchWindows) {
+        const oris = win.uprightOnly ? uprightOrientations : allOrientations;
+        for (const ori of oris) {
+          queryPlan.push({ win, ori });
+        }
+      }
+
+      const totalSteps = queryPlan.length + (isHybrid ? 2 : 0);
       let doneSteps = 0;
 
       this.matchStatusText.textContent = `🤖 AI解析中... (0/${totalSteps})`;
       this.matchBadgeContainer.innerHTML = `<span class="match-badge processing">${this.aiEngine.getEngineLabel()} で照合中</span>`;
 
       const queries = [];
-      for (const win of searchWindows) {
-        for (const ori of orientations) {
-          const vec = await this.aiEngine.extractEmbedding(snapshotCanvas, ori.deg, win, enhanceLighting);
-          queries.push({
-            win,
-            deg: ori.deg,
-            orientation: ori.label,
-            vec
-          });
-          doneSteps++;
-          this.matchStatusText.textContent = `🤖 AI解析中... (${doneSteps}/${totalSteps})`;
-          await yieldToUI();
-        }
+      for (const step of queryPlan) {
+        const srcWin = mapBoxToSnapshot(step.win);
+        const { vec, colorVec } = await this.aiEngine.extractQueryFeatures(
+          snapshotCanvas,
+          step.ori.deg,
+          srcWin,
+          enhanceLighting,
+          stage1Engine
+        );
+        const centeredVec = this.dbMeanVec
+          ? this.aiEngine.centerAndNormalize(vec, this.dbMeanVec)
+          : null;
+        const frameInfo = this.aiEngine.detectCardFrameType(snapshotCanvas, srcWin, step.ori.deg);
+        queries.push({
+          win: step.win,
+          srcWin,
+          deg: step.ori.deg,
+          orientation: step.ori.label,
+          vec,
+          centeredVec,
+          colorVec,
+          frameInfo
+        });
+        doneSteps++;
+        this.matchStatusText.textContent = `🤖 AI解析中... (${doneSteps}/${totalSteps})`;
+        await yieldToUI();
       }
 
-      // 全登録カード（3クロップ）とのコサイン類似度を算出
-      const scored = indexedCards.map((card) => {
-        let bestSim = -1;
+      // Stage 1: 全登録カードとの類似度を算出
+      let scored = indexedCards.map((card) => {
+        let bestRank = -1;
+        let bestRaw = 0;
         let bestOrientation = '正位置 (0°)';
         let bestDeg = 0;
         let bestWin = box;
+        let bestQueryIdx = 0;
+        let bestFrameInfo = null;
 
-        for (const q of queries) {
-          const simFull = this.aiEngine.cosineSimilarity(q.vec, card.feature);
-          const simCenter = card.centerFeature
-            ? this.aiEngine.cosineSimilarity(q.vec, card.centerFeature)
-            : -1;
-          const simTight = card.tightFeature
-            ? this.aiEngine.cosineSimilarity(q.vec, card.tightFeature)
-            : -1;
-          const sim = Math.max(simFull, simCenter, simTight);
+        for (let qi = 0; qi < queries.length; qi++) {
+          const q = queries[qi];
+          const { rankScore, rawSim } = this.scoreCardAgainstQuery(
+            card,
+            q,
+            false,
+            stage1AiWeight,
+            stage1ColorWeight,
+            applySidewaysGuard
+          );
 
-          if (sim > bestSim) {
-            bestSim = sim;
+          if (rankScore > bestRank) {
+            bestRank = rankScore;
+            bestRaw = rawSim;
             bestOrientation = q.orientation;
             bestDeg = q.deg;
             bestWin = q.win;
+            bestQueryIdx = qi;
+            bestFrameInfo = q.frameInfo;
           }
         }
 
         return {
           card,
-          score: bestSim,
+          score: bestRank,
+          displayScore: bestRaw,
+          stage1Score: bestRank,
+          stage1Raw: bestRaw,
           orientation: bestOrientation,
           deg: bestDeg,
-          matchedBox: bestWin
+          matchedBox: bestWin,
+          bestQueryIdx,
+          frameInfo: bestFrameInfo
         };
       });
 
       scored.sort((a, b) => b.score - a.score);
 
+      // Stage 2 (Hybridモード): 最良の最大2枠だけを DINOv2-small で推論し、キャッシュ済みの全カード＋上位12枚を精密再ランキング
+      if (isHybrid && scored.length > 1) {
+        const dinoReady = await this.aiEngine.ensureDinoLoaded((msg) => {
+          this.matchStatusText.textContent = `🎯 ${msg}`;
+        });
+
+        if (dinoReady) {
+          this.matchStatusText.textContent = `🎯 DINOv2 精密判定中... (${doneSteps}/${totalSteps})`;
+          await yieldToUI();
+
+          // 上位カードが選んだベスト枠（最大2パターン）だけをDINOv2で推論（12〜16回→最大2回に削減）
+          const selectedQueryIndices = [];
+          for (const item of scored.slice(0, 6)) {
+            if (!selectedQueryIndices.includes(item.bestQueryIdx)) {
+              selectedQueryIndices.push(item.bestQueryIdx);
+              if (selectedQueryIndices.length >= 2) break;
+            }
+          }
+
+          const dinoQueries = [];
+          for (const qi of selectedQueryIndices) {
+            const baseQ = queries[qi];
+            const { vec } = await this.aiEngine.extractQueryFeatures(
+              snapshotCanvas,
+              baseQ.deg,
+              baseQ.srcWin,
+              enhanceLighting,
+              'dinov2'
+            );
+            const centeredVec = this.dinoMeanVec
+              ? this.aiEngine.centerAndNormalize(vec, this.dinoMeanVec)
+              : null;
+            dinoQueries.push({
+              ...baseQ,
+              vec,
+              centeredVec
+            });
+            doneSteps++;
+            this.matchStatusText.textContent = `🎯 DINOv2 精密判定中... (${Math.min(doneSteps, totalSteps)}/${totalSteps})`;
+            await yieldToUI();
+          }
+
+          // Top8足切りを撤廃：DINOv2キャッシュ済みの全カード＋上位12枚すべてをDINOv2で再採点
+          for (let idx = 0; idx < scored.length; idx++) {
+            const item = scored[idx];
+            const c = item.card;
+            if (!c.dinoFeature) {
+              if (idx >= 12) continue;
+              const emb = await this.aiEngine.getOrComputeCardEmbeddings(c.id, c.safeCanvasElement, 'dinov2');
+              c.dinoFeature = emb.feature;
+              c.dinoCenterFeature = emb.centerFeature;
+              c.dinoTightFeature = emb.tightFeature;
+              if (this.dinoMeanVec) {
+                c.cDinoFeature = this.aiEngine.centerAndNormalize(c.dinoFeature, this.dinoMeanVec);
+                c.cDinoCenterFeature = this.aiEngine.centerAndNormalize(c.dinoCenterFeature, this.dinoMeanVec);
+                c.cDinoTightFeature = this.aiEngine.centerAndNormalize(c.dinoTightFeature, this.dinoMeanVec);
+              }
+            }
+
+            let bestDinoRank = -1;
+            let bestDinoRaw = 0;
+            let bestQ = dinoQueries[0];
+            for (const dq of dinoQueries) {
+              const { rankScore, rawSim } = this.scoreCardAgainstQuery(c, dq, true, 0.90, 0.10, applySidewaysGuard);
+              if (rankScore > bestDinoRank) {
+                bestDinoRank = rankScore;
+                bestDinoRaw = rawSim;
+                bestQ = dq;
+              }
+            }
+
+            if (bestDinoRank > -0.5) {
+              // MobileNet+色+枠(28%) + DINOv2+色+枠(72%) のハイブリッド統合スコア
+              item.score = item.stage1Score * 0.28 + bestDinoRank * 0.72;
+              item.displayScore = item.stage1Raw * 0.28 + bestDinoRaw * 0.72;
+              item.orientation = bestQ.orientation;
+              item.deg = bestQ.deg;
+              item.matchedBox = bestQ.win;
+              item.frameInfo = bestQ.frameInfo;
+            }
+          }
+
+          scored.sort((a, b) => b.score - a.score);
+        }
+      }
+
       const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(2);
+      // 順位と表示用%の逆転を防ぎつつ、1位と2位以下のスコア差を直感的に反映
+      if (scored.length > 0) {
+        const topAnchor = Math.max(0.1, Math.min(0.99, scored[0].displayScore ?? scored[0].score));
+        const topRank = scored[0].score;
+        scored[0].displayScore = topAnchor;
+        for (let i = 1; i < scored.length; i++) {
+          const gap = Math.max(0.001, topRank - scored[i].score);
+          scored[i].displayScore = Math.max(0.05, topAnchor - gap);
+        }
+      }
       const topMatch = scored[0];
       const secondMatch = scored[1];
       const margin = topMatch && secondMatch ? topMatch.score - secondMatch.score : 1;
@@ -992,7 +1864,7 @@ class YgoRemoteLensApp {
       const previewCanvas = this.aiEngine.preprocessToCanvas(
         snapshotCanvas,
         topMatch ? topMatch.deg : 0,
-        finalCropBox,
+        mapBoxToSnapshot(finalCropBox),
         enhanceLighting
       );
       this.cropPreviewCtx.clearRect(0, 0, 64, 64);
@@ -1004,7 +1876,11 @@ class YgoRemoteLensApp {
       const meta = {
         elapsedSec,
         margin,
-        engineLabel: this.aiEngine.getEngineLabel()
+        engineLabel: this.aiEngine.getEngineLabel(),
+        frameLabel:
+          topMatch && topMatch.frameInfo && topMatch.frameInfo.confidence >= 0.42
+            ? topMatch.frameInfo.label
+            : ''
       };
 
       this.lastRecognizedCardId = topMatch ? topMatch.card.id : null;
@@ -1098,17 +1974,19 @@ class YgoRemoteLensApp {
   }
 
   displayRecognitionResult(match, topCandidates, meta = null) {
-    const { card, score, orientation } = match;
+    const { card, score, displayScore, orientation } = match;
     this.currentMatch = match;
     this.currentCardId = card.id;
 
-    // AI埋め込みのコサイン類似度（0〜1）を直感的なパーセント表示に変換
-    const clampedScore = Math.max(0, Math.min(1, score));
+    // 画面表示には素のコサイン類似度（displayScore）を使用し、直感的な%表示を維持
+    const shownScore = displayScore !== undefined ? displayScore : score;
+    const clampedScore = Math.max(0, Math.min(1, shownScore));
     const percent = (clampedScore * 100).toFixed(1);
 
-    this.matchStatusText.textContent = `向き判定: ${orientation}`;
+    const frameSuffix = meta && meta.frameLabel ? ` / 枠: ${meta.frameLabel}` : '';
+    this.matchStatusText.textContent = `向き判定: ${orientation}${frameSuffix}`;
 
-    const isHighConfidence = !meta || meta.margin >= 0.04 || clampedScore >= 0.72;
+    const isHighConfidence = !meta || meta.margin >= 0.045 || clampedScore >= 0.70;
     const badgeClass = isHighConfidence ? 'match-badge' : 'match-badge medium';
     const confidenceLabel = isHighConfidence ? '✅ 高信頼' : '⚠️ 候補確認推奨';
     const engineSuffix = meta
@@ -1159,7 +2037,8 @@ class YgoRemoteLensApp {
       this.candidatesSection.style.display = 'block';
       this.candidatesList.innerHTML = '';
       topCandidates.forEach((item, idx) => {
-        const p = (Math.max(0, Math.min(1, item.score)) * 100).toFixed(1);
+        const shown = item.displayScore !== undefined ? item.displayScore : item.score;
+        const p = (Math.max(0, Math.min(1, shown)) * 100).toFixed(1);
         const thumbSrc = item.card.image_crop;
 
         const div = document.createElement('div');
@@ -1371,6 +2250,7 @@ class YgoRemoteLensApp {
         const fallbackCanvas = this.createFallbackCardArt(newCard);
         const entry = {
           ...newCard,
+          frameType: this.aiEngine.getCardFrameTypeFromMeta(newCard),
           safeCanvasElement: fallbackCanvas,
           feature: null,
           centerFeature: null,
@@ -1380,16 +2260,37 @@ class YgoRemoteLensApp {
         };
         this.cardsDB.push(entry);
         await this.loadRealImageForCard(entry);
-        if (this.aiEngine.isReady) {
+        if (this.useSiftServer && this.siftServerBase !== null) {
+          try {
+            await fetch(`${this.siftServerBase}/api/cards/add`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: entry.id,
+                name_ja: entry.name_ja,
+                image_full: entry.image_full,
+                image_crop: entry.image_crop
+              })
+            });
+            entry.aiIndexed = true;
+            entry.isFallback = false;
+          } catch (_) {
+            // SIFT追加失敗時は無視
+          }
+        } else if (this.aiEngine.isReady) {
           const emb = await this.aiEngine.getOrComputeCardEmbeddings(entry.id, entry.safeCanvasElement);
           entry.feature = emb.feature;
           entry.centerFeature = emb.centerFeature;
           entry.tightFeature = emb.tightFeature;
+          entry.colorFeature = emb.colorFeature;
+          entry.centerColorFeature = emb.centerColorFeature;
+          entry.tightColorFeature = emb.tightColorFeature;
           entry.aiIndexed = true;
         }
         added++;
       }
 
+      this.recomputeHubnessStats(false);
       this.renderDBList();
       this.setStatusBadge(
         `✅ AI認識稼働中 [${this.aiEngine.getEngineLabel()}] (${this.cardsDB.length}枚登録済)`,

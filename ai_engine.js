@@ -18,7 +18,7 @@
   const INPUT_SIZE = 224;
   const CACHE_DB_NAME = 'ygo_remote_lens_ai_cache_v2';
   const CACHE_STORE_NAME = 'embeddings';
-  const CACHE_VERSION = 'v2_enh1';
+  const CACHE_VERSION = 'v3_luma1';
 
   /**
    * IndexedDB ベースの軽量ベクトルキャッシュ
@@ -177,14 +177,17 @@
    */
   class YgoAIEngine {
     constructor() {
-      this.activeEngine = 'mobilenet'; // 'dinov2' | 'mobilenet' | 'legacy'
+      this.activeEngine = 'hybrid'; // 'hybrid' | 'dinov2' | 'mobilenet' | 'legacy'
       this.backendInfo = '';
+      this.dinoBackendInfo = '';
       this.isReady = false;
       this.cache = new EmbeddingCache();
 
       // Transformers.js (DINOv2)
       this.transformersModule = null;
       this.dinoPipe = null;
+      this.dinoLoadPromise = null;
+      this._dinoQueue = Promise.resolve();
 
       // TensorFlow.js (MobileNet v2)
       this.mobilenetModel = null;
@@ -194,11 +197,22 @@
       this.workCanvas.width = INPUT_SIZE;
       this.workCanvas.height = INPUT_SIZE;
       this.workCtx = this.workCanvas.getContext('2d', { willReadFrequently: true });
+
+      // 空間カラー特徴用の10x10オフスクリーンCanvas
+      this.colorCanvas = document.createElement('canvas');
+      this.colorCanvas.width = 10;
+      this.colorCanvas.height = 10;
+      this.colorCtx = this.colorCanvas.getContext('2d', { willReadFrequently: true });
     }
 
     getEngineLabel() {
+      if (this.activeEngine === 'hybrid') {
+        return this.dinoPipe
+          ? `Hybrid (MobileNet+DINOv2)`
+          : `Hybrid (MobileNet+色特徴)`;
+      }
       if (this.activeEngine === 'dinov2') {
-        return `DINOv2-small (${this.backendInfo || 'AI'})`;
+        return `DINOv2-small (${this.dinoBackendInfo || this.backendInfo || 'AI'})`;
       }
       if (this.activeEngine === 'mobilenet') {
         return `MobileNet v2 (${this.backendInfo || 'WebGL'})`;
@@ -206,13 +220,43 @@
       return '軽量フォールバック (16x16)';
     }
 
+    isDinoReady() {
+      return Boolean(this.dinoPipe);
+    }
+
+    async ensureDinoLoaded(onProgress = () => {}) {
+      if (this.dinoPipe) return true;
+      if (!this.dinoLoadPromise) {
+        this.dinoLoadPromise = this.loadDinoV2(onProgress).catch((err) => {
+          console.warn('[YgoAIEngine] DINOv2バックグラウンド読込失敗:', err);
+          this.dinoLoadPromise = null;
+          return false;
+        });
+      }
+      await this.dinoLoadPromise;
+      return Boolean(this.dinoPipe);
+    }
+
     /**
      * 指定エンジンを初期化（失敗時は自動フォールバック）
      */
-    async init(engineId = 'mobilenet', onProgress = () => {}) {
+    async init(engineId = 'hybrid', onProgress = () => {}) {
       this.isReady = false;
 
-      if (engineId === 'dinov2') {
+      if (engineId === 'hybrid') {
+        try {
+          await this.loadMobileNet(onProgress);
+          this.activeEngine = 'hybrid';
+          this.isReady = true;
+          // DINOv2はバックグラウンドで非同期プリロード開始（起動をブロックしない）
+          this.ensureDinoLoaded();
+          return this.activeEngine;
+        } catch (err) {
+          console.warn('[YgoAIEngine] Hybrid用MobileNetロード失敗、DINOv2単体へ切替:', err);
+        }
+      }
+
+      if (engineId === 'dinov2' || engineId === 'hybrid') {
         try {
           await this.loadDinoV2(onProgress);
           this.activeEngine = 'dinov2';
@@ -224,7 +268,7 @@
         }
       }
 
-      if (engineId === 'mobilenet' || engineId === 'dinov2') {
+      if (engineId === 'mobilenet' || engineId === 'dinov2' || engineId === 'hybrid') {
         try {
           await this.loadMobileNet(onProgress);
           this.activeEngine = 'mobilenet';
@@ -295,7 +339,8 @@
           dtype: 'q8',
           progress_callback: progressCallback
         });
-        this.backendInfo = device.toUpperCase();
+        this.dinoBackendInfo = device.toUpperCase();
+        if (this.activeEngine === 'dinov2') this.backendInfo = this.dinoBackendInfo;
       } catch (gpuErr) {
         if (device === 'webgpu') {
           console.warn('[YgoAIEngine] WebGPU初期化失敗、WASMで再試行:', gpuErr);
@@ -305,7 +350,8 @@
             dtype: 'q8',
             progress_callback: progressCallback
           });
-          this.backendInfo = 'WASM';
+          this.dinoBackendInfo = 'WASM';
+          if (this.activeEngine === 'dinov2') this.backendInfo = 'WASM';
         } else {
           throw gpuErr;
         }
@@ -444,15 +490,15 @@
       // ノイズの過剰増幅を防ぐため、最小スパンを確保
       const span = Math.max(55, pHigh - pLow);
 
-      // 暗いカード（例：ディヴェル等の暗所撮影）ほど暗部を穏やかに持ち上げるガンマ値を選択
+      // 暗いカード（例：ディヴェル・ティ・フォン等）の暗部を持ち上げつつ、ノイズやホイル反射の過剰増幅を抑える
       let gamma = 1.0;
       if (meanLuma < 85) {
-        gamma = 0.72;
+        gamma = 0.78;
       } else if (meanLuma < 115) {
-        gamma = 0.84;
+        gamma = 0.88;
       } else if (meanLuma > 185) {
         // 全体的に白っぽく光が反射している場合はわずかに引き締める
-        gamma = 1.15;
+        gamma = 1.12;
       }
 
       // ルックアップテーブルで高速変換
@@ -465,13 +511,21 @@
         lut[v] = Math.round(corrected * 255);
       }
 
-      // 補正を元画像と75:25でブレンド（極端な破綻を防ぎつつ暗部・反射を強力に改善）
-      const alpha = 0.75;
+      // 輝度（明るさ）のみにLUTを適用し、R/G/Bに同じ倍率をかけることで元の色味（紫・青・黒など）を絶対に壊さない
+      const alpha = 0.55;
       const invAlpha = 1 - alpha;
       for (let i = 0; i < data.length; i += 4) {
-        data[i] = Math.round(lut[data[i]] * alpha + data[i] * invAlpha);
-        data[i + 1] = Math.round(lut[data[i + 1]] * alpha + data[i + 1] * invAlpha);
-        data[i + 2] = Math.round(lut[data[i + 2]] * alpha + data[i + 2] * invAlpha);
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const l = 0.299 * r + 0.587 * g + 0.114 * b;
+        const lIdx = Math.min(255, Math.max(0, Math.round(l)));
+        const targetL = lut[lIdx] * alpha + l * invAlpha;
+        const scale = l > 4 ? Math.min(2.1, targetL / l) : 1.0;
+
+        data[i] = Math.min(255, Math.round(r * scale));
+        data[i + 1] = Math.min(255, Math.round(g * scale));
+        data[i + 2] = Math.min(255, Math.round(b * scale));
       }
 
       ctx.putImageData(imgData, 0, 0);
@@ -480,30 +534,159 @@
     /**
      * 画像ソースから L2正規化済みのAI特徴ベクトルを抽出
      */
-    async extractEmbedding(source, rotateDeg = 0, cropRect = null, enhanceLighting = true) {
-      const canvas = this.preprocessToCanvas(source, rotateDeg, cropRect, enhanceLighting);
+    async extractEmbedding(source, rotateDeg = 0, cropRect = null, enhanceLighting = true, targetEngine = null) {
+      const dedicatedCanvas = document.createElement('canvas');
+      const canvas = this.preprocessToCanvas(source, rotateDeg, cropRect, enhanceLighting, dedicatedCanvas);
+      const engine = targetEngine || (this.activeEngine === 'hybrid' ? 'mobilenet' : this.activeEngine);
 
-      if (this.activeEngine === 'dinov2' && this.dinoPipe) {
+      if (engine === 'dinov2' && this.dinoPipe) {
         return await this.extractDinoV2Embedding(canvas);
       }
-      if (this.activeEngine === 'mobilenet' && this.mobilenetModel) {
+      if (engine === 'mobilenet' && this.mobilenetModel) {
         return this.extractMobileNetEmbedding(canvas);
       }
       return this.extractLegacyFeature(canvas);
     }
 
     /**
-     * DINOv2-small 特徴抽出
+     * AI特徴ベクトルと空間カラー配色特徴を同時に抽出（+0.1ms未満で色誤爆を抑制）
+     */
+    async extractQueryFeatures(source, rotateDeg = 0, cropRect = null, enhanceLighting = true, targetEngine = null) {
+      const dedicatedCanvas = document.createElement('canvas');
+      const canvas = this.preprocessToCanvas(source, rotateDeg, cropRect, enhanceLighting, dedicatedCanvas);
+      const engine = targetEngine || (this.activeEngine === 'hybrid' ? 'mobilenet' : this.activeEngine);
+
+      let vec;
+      if (engine === 'dinov2' && this.dinoPipe) {
+        vec = await this.extractDinoV2Embedding(canvas);
+      } else if (engine === 'mobilenet' && this.mobilenetModel) {
+        vec = this.extractMobileNetEmbedding(canvas);
+      } else {
+        vec = this.extractLegacyFeature(canvas);
+      }
+
+      const colorVec = this.extractColorFeature(canvas);
+      return { vec, colorVec, canvas };
+    }
+
+    /**
+     * 10x10グリッドの照明不変・空間カラー＆エッジ勾配特徴（400次元）
+     * MobileNet等の深層モデルが最後に失いやすい「イラスト各部の色相・明暗配置」を補完する
+     */
+    extractColorFeature(canvas) {
+      const G = 10;
+      const ctx = this.colorCtx;
+      ctx.clearRect(0, 0, G, G);
+      ctx.drawImage(canvas, 0, 0, G, G);
+      const data = ctx.getImageData(0, 0, G, G).data;
+
+      const count = G * G;
+      const luma = new Float32Array(count);
+      const rg = new Float32Array(count);
+      const by = new Float32Array(count);
+
+      let lumaMean = 0;
+      for (let i = 0; i < count; i++) {
+        const r = data[i * 4] / 255;
+        const g = data[i * 4 + 1] / 255;
+        const b = data[i * 4 + 2] / 255;
+        const l = 0.299 * r + 0.587 * g + 0.114 * b;
+        luma[i] = l;
+        lumaMean += l;
+        // 反対色空間（照明の明るさ変化に強く、赤/緑・青/黄の固有色差を保持）
+        rg[i] = r - g;
+        by[i] = b - 0.5 * (r + g);
+      }
+      lumaMean /= count;
+
+      let lumaVar = 0;
+      for (let i = 0; i < count; i++) {
+        const d = luma[i] - lumaMean;
+        lumaVar += d * d;
+      }
+      const lumaStd = Math.sqrt(lumaVar / count) || 0.15;
+
+      const out = new Float32Array(count * 4);
+      for (let y = 0; y < G; y++) {
+        for (let x = 0; x < G; x++) {
+          const idx = y * G + x;
+          const xPrev = y * G + Math.max(0, x - 1);
+          const xNext = y * G + Math.min(G - 1, x + 1);
+          const yPrev = Math.max(0, y - 1) * G + x;
+          const yNext = Math.min(G - 1, y + 1) * G + x;
+
+          const gx = luma[xNext] - luma[xPrev];
+          const gy = luma[yNext] - luma[yPrev];
+          const grad = Math.sqrt(gx * gx + gy * gy);
+
+          // 外周1マスは赤いスリーブやカード枠が映り込みやすいため重みを下げ、中心イラスト色を重視
+          const isBorder = x === 0 || x === G - 1 || y === 0 || y === G - 1;
+          const spatialWeight = isBorder ? 0.25 : 1.0;
+
+          const base = idx * 4;
+          out[base] = ((luma[idx] - lumaMean) / lumaStd) * 0.24 * spatialWeight;
+          out[base + 1] = rg[idx] * 1.35 * spatialWeight;
+          out[base + 2] = by[idx] * 1.35 * spatialWeight;
+          out[base + 3] = grad * 0.80 * spatialWeight;
+        }
+      }
+
+      return l2Normalize(out);
+    }
+
+    /**
+     * 複数ベクトルの平均ベクトル（重心）を算出（ハブ現象対策のMean-Centering用）
+     */
+    computeMeanVector(vectors) {
+      if (!vectors || vectors.length === 0) return null;
+      const dim = vectors[0].length;
+      const mean = new Float32Array(dim);
+      let valid = 0;
+      for (const v of vectors) {
+        if (!v || v.length !== dim) continue;
+        for (let i = 0; i < dim; i++) {
+          mean[i] += v[i];
+        }
+        valid++;
+      }
+      if (valid === 0) return null;
+      for (let i = 0; i < dim; i++) {
+        mean[i] /= valid;
+      }
+      return mean;
+    }
+
+    /**
+     * 平均ベクトルを差し引いてL2正規化（全カード共通成分を除去して弁別力を大幅向上）
+     */
+    centerAndNormalize(vec, meanVec) {
+      if (!vec) return null;
+      if (!meanVec || vec.length !== meanVec.length) return vec;
+      const out = new Float32Array(vec.length);
+      for (let i = 0; i < vec.length; i++) {
+        out[i] = vec[i] - meanVec[i];
+      }
+      return l2Normalize(out);
+    }
+
+    /**
+     * DINOv2-small 特徴抽出（WASM同時実行衝突を防ぐ直列キュー付き）
      * CLSトークン（全体構図・意味）とパッチ平均トークン（細部テクスチャ）を結合し、
      * 暗色系カードや部分的な光反射にも強い768次元ベクトルを生成
      */
     async extractDinoV2Embedding(canvas) {
-      const { RawImage } = this.transformersModule;
-      const input =
-        RawImage && typeof RawImage.fromCanvas === 'function'
-          ? RawImage.fromCanvas(canvas)
-          : canvas.toDataURL('image/jpeg', 0.92);
-      const output = await this.dinoPipe(input);
+      const runInference = async () => {
+        const { RawImage } = this.transformersModule;
+        const input =
+          RawImage && typeof RawImage.fromCanvas === 'function'
+            ? RawImage.fromCanvas(canvas)
+            : canvas.toDataURL('image/jpeg', 0.92);
+        return await this.dinoPipe(input);
+      };
+
+      const nextPromise = this._dinoQueue.then(runInference, runInference);
+      this._dinoQueue = nextPromise.catch(() => {});
+      const output = await nextPromise;
 
       const data = output.data;
       const dims = output.dims; // 通常 [1, 257, 384] または [1, 384]
@@ -588,13 +771,46 @@
     }
 
     /**
+     * カード1枚分のマルチクロップ空間カラー特徴を高速抽出（<0.2ms）
+     */
+    computeCardColorFeatures(safeCanvas) {
+      const W = safeCanvas.width;
+      const H = safeCanvas.height;
+      const tmp = document.createElement('canvas');
+
+      const cFull = this.preprocessToCanvas(safeCanvas, 0, null, true, tmp);
+      const colorFeature = this.extractColorFeature(cFull);
+
+      const cCenter = this.preprocessToCanvas(
+        safeCanvas,
+        0,
+        { x: W * 0.08, y: H * 0.08, w: W * 0.84, h: H * 0.84 },
+        true,
+        tmp
+      );
+      const centerColorFeature = this.extractColorFeature(cCenter);
+
+      const cTight = this.preprocessToCanvas(
+        safeCanvas,
+        0,
+        { x: W * 0.15, y: H * 0.15, w: W * 0.70, h: H * 0.70 },
+        true,
+        tmp
+      );
+      const tightColorFeature = this.extractColorFeature(cTight);
+
+      return { colorFeature, centerColorFeature, tightColorFeature };
+    }
+
+    /**
      * カード1枚分のマルチクロップ特徴ベクトルを取得（IndexedDBキャッシュ優先）
      * - full   : イラスト全体 (100%)
      * - center : 少し内枠 (84%) — 外側のカード枠が映り込んだ／逆に内側だけ囲んだズレ対策
      * - tight  : 中心コア (70%) — 大きくトリミングされた／端が光で飛んだ場合の対策
      */
-    async getOrComputeCardEmbeddings(cardId, safeCanvas) {
-      const engineId = this.activeEngine;
+    async getOrComputeCardEmbeddings(cardId, safeCanvas, targetEngine = null) {
+      const engineId = targetEngine || (this.activeEngine === 'hybrid' ? 'mobilenet' : this.activeEngine);
+      const colorFeats = this.computeCardColorFeatures(safeCanvas);
 
       if (engineId !== 'legacy') {
         const [cFull, cCenter, cTight] = await Promise.all([
@@ -607,6 +823,7 @@
             feature: cFull,
             centerFeature: cCenter,
             tightFeature: cTight,
+            ...colorFeats,
             fromCache: true
           };
         }
@@ -615,18 +832,20 @@
       const W = safeCanvas.width;
       const H = safeCanvas.height;
 
-      const feature = await this.extractEmbedding(safeCanvas, 0, null, true);
+      const feature = await this.extractEmbedding(safeCanvas, 0, null, true, engineId);
       const centerFeature = await this.extractEmbedding(
         safeCanvas,
         0,
         { x: W * 0.08, y: H * 0.08, w: W * 0.84, h: H * 0.84 },
-        true
+        true,
+        engineId
       );
       const tightFeature = await this.extractEmbedding(
         safeCanvas,
         0,
         { x: W * 0.15, y: H * 0.15, w: W * 0.70, h: H * 0.70 },
-        true
+        true,
+        engineId
       );
 
       if (engineId !== 'legacy') {
@@ -637,7 +856,13 @@
         ]);
       }
 
-      return { feature, centerFeature, tightFeature, fromCache: false };
+      return {
+        feature,
+        centerFeature,
+        tightFeature,
+        ...colorFeats,
+        fromCache: false
+      };
     }
 
     async clearCache() {
@@ -646,6 +871,171 @@
 
     cosineSimilarity(vecA, vecB) {
       return cosineSimilarity(vecA, vecB);
+    }
+
+    /**
+     * カードDBのtype_jaからカード枠種別を返す
+     */
+    getCardFrameTypeFromMeta(card) {
+      const t = String((card && card.type_ja) || '');
+      if (t.includes('エクシーズ')) return 'xyz';
+      if (t.includes('リンク')) return 'link';
+      if (t.includes('シンクロ')) return 'synchro';
+      if (t.includes('融合')) return 'fusion';
+      if (t.includes('魔法')) return 'spell';
+      if (t.includes('罠')) return 'trap';
+      if (t.includes('通常モンスター')) return 'normal';
+      if (t.includes('モンスター')) return 'effect';
+      return 'unknown';
+    }
+
+    /**
+     * イラスト枠のすぐ外側の細い領域（左右・上下）から遊戯王カードの枠色（黒X/青L/白S/紫融合/緑魔法/桃罠/茶効果）を推定
+     */
+    detectCardFrameType(snapshotCanvas, artRect, rotateDeg = 0) {
+      if (!snapshotCanvas || !artRect) {
+        return { frameType: 'unknown', label: '枠未判定', confidence: 0 };
+      }
+
+      const W = snapshotCanvas.width;
+      const H = snapshotCanvas.height;
+      const ctx = snapshotCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return { frameType: 'unknown', label: '枠未判定', confidence: 0 };
+
+      // 0°/180°（縦向きカード）はイラストの左右が確実にカード枠、90°/270°（横向き）は上下が確実にカード枠
+      const isSideways = rotateDeg === 90 || rotateDeg === 270;
+      const marginIn = Math.max(2, Math.round(Math.min(artRect.w, artRect.h) * 0.04));
+      const marginOut = Math.max(5, Math.round(Math.min(artRect.w, artRect.h) * 0.12));
+      const stripThickness = Math.max(3, marginOut - marginIn);
+
+      const strips = isSideways
+        ? [
+            { x: artRect.x + artRect.w * 0.15, y: artRect.y - marginOut, w: artRect.w * 0.7, h: stripThickness },
+            { x: artRect.x + artRect.w * 0.15, y: artRect.y + artRect.h + marginIn, w: artRect.w * 0.7, h: stripThickness }
+          ]
+        : [
+            { x: artRect.x - marginOut, y: artRect.y + artRect.h * 0.15, w: stripThickness, h: artRect.h * 0.7 },
+            { x: artRect.x + artRect.w + marginIn, y: artRect.y + artRect.h * 0.15, w: stripThickness, h: artRect.h * 0.7 }
+          ];
+
+      const stripStats = [];
+      for (const s of strips) {
+        const sx = Math.max(0, Math.min(W - 1, Math.round(s.x)));
+        const sy = Math.max(0, Math.min(H - 1, Math.round(s.y)));
+        const sw = Math.max(1, Math.min(W - sx, Math.round(s.w)));
+        const sh = Math.max(1, Math.min(H - sy, Math.round(s.h)));
+        if (sw < 2 || sh < 2) continue;
+
+        const imgData = ctx.getImageData(sx, sy, sw, sh).data;
+        const rs = [];
+        const gs = [];
+        const bs = [];
+        for (let i = 0; i < imgData.length; i += 4) {
+          const r = imgData[i];
+          const g = imgData[i + 1];
+          const b = imgData[i + 2];
+          // 極端な白飛び光反射を除外
+          if (r > 238 && g > 238 && b > 238) continue;
+          rs.push(r);
+          gs.push(g);
+          bs.push(b);
+        }
+        if (rs.length < 6) continue;
+        rs.sort((a, b) => a - b);
+        gs.sort((a, b) => a - b);
+        bs.sort((a, b) => a - b);
+        const mid = Math.floor(rs.length / 2);
+        stripStats.push({ r: rs[mid], g: gs[mid], b: bs[mid] });
+      }
+
+      if (stripStats.length === 0) {
+        return { frameType: 'unknown', label: '枠未判定', confidence: 0 };
+      }
+
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (const st of stripStats) {
+        r += st.r;
+        g += st.g;
+        b += st.b;
+      }
+      r /= stripStats.length;
+      g /= stripStats.length;
+      b /= stripStats.length;
+
+      // 左右（または上下）の枠色の一致度から信頼度を算出（片方が机やスリーブなら一致度が落ちる）
+      let consistency = 0.7;
+      if (stripStats.length === 2) {
+        const diff =
+          (Math.abs(stripStats[0].r - stripStats[1].r) +
+            Math.abs(stripStats[0].g - stripStats[1].g) +
+            Math.abs(stripStats[0].b - stripStats[1].b)) /
+          3;
+        consistency = Math.max(0, Math.min(1, 1 - diff / 65));
+      }
+
+      const rn = r / 255;
+      const gn = g / 255;
+      const bn = b / 255;
+      const max = Math.max(rn, gn, bn);
+      const min = Math.min(rn, gn, bn);
+      const delta = max - min;
+      const v = max;
+      const s = max === 0 ? 0 : delta / max;
+
+      let h = 0;
+      if (delta > 0.001) {
+        if (max === rn) h = 60 * (((gn - bn) / delta) % 6);
+        else if (max === gn) h = 60 * ((bn - rn) / delta + 2);
+        else h = 60 * ((rn - gn) / delta + 4);
+        if (h < 0) h += 360;
+      }
+
+      let frameType = 'unknown';
+      let label = '枠未判定';
+      let typeConf = 0;
+
+      if (v < 0.34 && s < 0.38) {
+        frameType = 'xyz';
+        label = '黒枠 (エクシーズ)';
+        typeConf = 0.92;
+      } else if (v > 0.62 && s < 0.22) {
+        frameType = 'synchro';
+        label = '白枠 (シンクロ)';
+        typeConf = 0.85;
+      } else if (s >= 0.16 && h >= 130 && h <= 198) {
+        frameType = 'spell';
+        label = '緑枠 (魔法)';
+        typeConf = 0.9;
+      } else if (s >= 0.18 && h > 198 && h <= 248) {
+        frameType = 'link';
+        label = '青枠 (リンク)';
+        typeConf = 0.9;
+      } else if (s >= 0.16 && h > 248 && h <= 298) {
+        frameType = 'fusion';
+        label = '紫枠 (融合)';
+        typeConf = 0.82;
+      } else if (s >= 0.18 && h > 298 && h <= 346) {
+        frameType = 'trap';
+        label = '桃紫枠 (罠)';
+        typeConf = 0.88;
+      } else if (s >= 0.18 && h >= 10 && h < 42) {
+        frameType = 'effect';
+        label = '茶枠 (効果モンスター)';
+        typeConf = 0.82;
+      } else if (s >= 0.18 && h >= 42 && h <= 65) {
+        frameType = 'normal';
+        label = '黄枠 (通常モンスター)';
+        typeConf = 0.75;
+      }
+
+      return {
+        frameType,
+        label,
+        confidence: typeConf * consistency,
+        rgb: [Math.round(r), Math.round(g), Math.round(b)]
+      };
     }
   }
 

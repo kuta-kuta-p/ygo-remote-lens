@@ -301,11 +301,13 @@
 
     .toolbar-sub {
       background-color: rgba(30, 41, 59, 0.85);
-      padding: 8px 16px;
+      padding: 8px 14px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
       font-size: 0.82rem;
       color: var(--text-sub);
     }
@@ -313,7 +315,8 @@
     .mode-switch {
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
+      flex-wrap: wrap;
     }
 
     .mode-switch label {
@@ -322,6 +325,36 @@
       gap: 5px;
       cursor: pointer;
       color: var(--text-main);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .scan-zone-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .scan-btn {
+      padding: 4px 10px;
+      font-size: 0.78rem;
+      border-radius: 5px;
+      background-color: #1e293b;
+      border: 1px solid var(--border);
+      color: var(--text-main);
+    }
+
+    .scan-btn.active {
+      background-color: #065f46;
+      border-color: #10b981;
+      color: #6ee7b7;
+    }
+
+    .scan-btn.setting {
+      background-color: #78350f;
+      border-color: #fbbf24;
+      color: #fde68a;
     }
 
     .canvas-container {
@@ -936,27 +969,41 @@
     <!-- 中央：キャプチャ画面＆クリック領域 -->
     <section class="viewport-area">
       <div class="toolbar-sub">
-        <div>
-          💡 <strong>使い方:</strong> 盤面のカードを<strong>クリック</strong>（または<strong>ドラッグで四角く囲む</strong>）と、AIが左側にカード効果を出します（逆さま・暗所・反射対応！）
+        <div class="scan-zone-controls">
+          <button id="btnSetScanZone" class="scan-btn" title="定位置スキャンエリアをドラッグで指定します">
+            🎯 定位置スキャン枠を設定
+          </button>
+          <button id="btnToggleAutoScan" class="scan-btn" title="定位置スキャン枠にカードが置かれたら自動認識します">
+            📡 自動認識: OFF
+          </button>
+          <button id="btnClearScanZone" class="icon-btn" style="display: none;" title="スキャン枠を消去します">
+            ✕ 枠消去
+          </button>
+          <span id="scanZoneHint" style="font-size: 0.76rem; color: var(--text-sub);">
+            盤面クリックでも随時認識できます
+          </span>
         </div>
         <div class="mode-switch">
-          <label title="認識に使用するブラウザ内AIモデルを選択します">
-            AIエンジン:
+          <label title="認識に使用するAI/画像認識エンジンを選択します">
+            エンジン:
             <select id="aiEngineSelect" style="background:#0f172a; color:#38bdf8; font-weight:600; border:1px solid #475569; border-radius:4px; padding:2px 6px;">
-              <option value="mobilenet" selected>⚡ MobileNet v2 (高速WebGL)</option>
-              <option value="dinov2">🎯 DINOv2-small (高精度AI)</option>
+              <option value="sift">⚡ OpenCV SIFT (Python高精度 0.3秒)</option>
+              <option value="hybrid" selected>🔥 ハイブリッド (ブラウザAI)</option>
+              <option value="mobilenet">⚡ MobileNet v2 (ブラウザ高速)</option>
+              <option value="dinov2">🎯 DINOv2-small (ブラウザ精密)</option>
             </select>
           </label>
-          <label title="暗いカード（ディヴェル等）やスリーブの光反射を自動で補正してからAIに認識させます">
+          <label title="ブラウザAI使用時の暗所・反射補正を切り替えます">
             <input type="checkbox" id="enhanceLightingCheck" checked />
             暗所・反射補正
           </label>
           <label>
             クリック枠:
             <select id="cropSizeSelect" style="background:#0f172a; color:#fff; border:1px solid #475569; border-radius:4px; padding:2px 6px;">
-              <option value="90">小 (遠め)</option>
-              <option value="130" selected>中 (標準)</option>
-              <option value="180">大 (アップ)</option>
+              <option value="65">極小 (全体引き)</option>
+              <option value="85" selected>小 (標準・引き)</option>
+              <option value="110">中 (やや近め)</option>
+              <option value="150">大 (アップ)</option>
             </select>
           </label>
         </div>
