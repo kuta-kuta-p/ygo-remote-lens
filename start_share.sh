@@ -57,5 +57,5 @@ echo "✅ ローカルサーバー準備完了: http://localhost:${PORT}"
 echo "🌐 友達共有用の一時HTTPS URLを発行中（Ctrl+C で終了）..."
 echo "------------------------------------------------------------"
 
-# 3. アカウント不要の Cloudflare Quick Tunnel 起動
-"$CF_BIN" tunnel --url "http://127.0.0.1:${PORT}"
+# 3. アカウント不要の Cloudflare Quick Tunnel 起動（WSL2/家庭用回線でのQUIC切断を防ぐため http2 を使用）
+"$CF_BIN" tunnel --protocol http2 --url "http://127.0.0.1:${PORT}"

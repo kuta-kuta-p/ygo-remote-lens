@@ -1505,36 +1505,75 @@ class YgoRemoteLensApp {
   }
 
   /**
-   * Python OpenCV SIFT + RANSAC サーバーで高速・超高精度認識
+   * Python OpenCV SIFT + RANSAC サーバーで高速・超高精度認識（送信画像軽量化＆トンネル切断時自動リトライ対応）
    */
   async recognizeWithSiftServer(snapshotCanvas, srcRect, displayBox, isAutoScan = false) {
     const startTime = performance.now();
 
+    // サーバー側の上限520pxに合わせて事前に軽量リサイズし、細い回線でも一瞬で送信できるようにする
+    const maxDim = 520;
+    const srcMax = Math.max(1, srcRect.w, srcRect.h);
+    const scale = Math.min(1, maxDim / srcMax);
+    const outW = Math.max(32, Math.round(srcRect.w * scale));
+    const outH = Math.max(32, Math.round(srcRect.h * scale));
+
     const cropCanvas = document.createElement('canvas');
-    const outW = Math.max(32, Math.round(srcRect.w));
-    const outH = Math.max(32, Math.round(srcRect.h));
     cropCanvas.width = outW;
     cropCanvas.height = outH;
-    cropCanvas.getContext('2d').drawImage(snapshotCanvas, srcRect.x, srcRect.y, srcRect.w, srcRect.h, 0, 0, outW, outH);
+    const cropCtx = cropCanvas.getContext('2d');
+    cropCtx.imageSmoothingEnabled = true;
+    cropCtx.imageSmoothingQuality = 'high';
+    cropCtx.drawImage(snapshotCanvas, srcRect.x, srcRect.y, srcRect.w, srcRect.h, 0, 0, outW, outH);
 
     if (!isAutoScan) {
       this.matchStatusText.textContent = '⚡ OpenCV SIFT サーバーで解析中...';
       this.matchBadgeContainer.innerHTML = `<span class="match-badge processing">OpenCV SIFT + RANSAC で照合中</span>`;
     }
 
-    const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.9));
-    const formData = new FormData();
-    formData.append('file', blob, 'crop.jpg');
-    formData.append('mode', 'auto');
+    const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.85));
 
-    const res = await fetch(`${this.siftServerBase}/api/recognize`, {
-      method: 'POST',
-      body: formData
-    });
-    if (!res.ok) {
-      throw new Error(`SIFTサーバーエラー (${res.status})`);
+    let data = null;
+    let lastErr = null;
+    const MAX_ATTEMPTS = 3;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const formData = new FormData();
+      formData.append('file', blob, 'crop.jpg');
+      formData.append('mode', 'auto');
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const res = await fetch(`${this.siftServerBase}/api/recognize`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+
+        if (res.status === 502 || res.status === 503 || res.status === 504) {
+          throw new Error(`トンネル再接続中 (${res.status})`);
+        }
+        if (!res.ok) {
+          throw new Error(`SIFTサーバーエラー (${res.status})`);
+        }
+        data = await res.json();
+        break;
+      } catch (err) {
+        clearTimeout(timer);
+        lastErr = err;
+        if (attempt < MAX_ATTEMPTS) {
+          if (!isAutoScan) {
+            this.matchStatusText.textContent = `🔄 通信再試行中 (${attempt + 1}/${MAX_ATTEMPTS})...`;
+          }
+          await new Promise((r) => setTimeout(r, 1100 * attempt));
+        }
+      }
     }
-    const data = await res.json();
+
+    if (!data) {
+      throw lastErr || new Error('SIFTサーバーへ接続できませんでした');
+    }
     if (!data.ok) {
       throw new Error(data.error || 'SIFT認識に失敗しました');
     }
