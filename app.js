@@ -383,6 +383,17 @@ class YgoRemoteLensApp {
   }
 
   /**
+   * サーバー接続時は自サーバーキャッシュ画像（/api/card-image/...）を返し、外部CDN常時通信をなくす
+   */
+  getCardImageUrl(card, kind = 'crop') {
+    if (!card) return '';
+    if (this.useSiftServer && this.siftServerBase !== null) {
+      return `${this.siftServerBase}/api/card-image/${kind}/${card.id}.jpg`;
+    }
+    return kind === 'full' ? card.image_full : card.image_crop;
+  }
+
+  /**
    * 初期カードデータベースと認識エンジンの初期化（Python SIFTサーバーがあれば即座に接続・最速起動）
    */
   async initDatabase() {
@@ -403,7 +414,7 @@ class YgoRemoteLensApp {
       };
     });
 
-    this.renderDBList();
+    if (this.dbCount) this.dbCount.textContent = this.cardsDB.length;
     this.startDemoBoard();
     this.startRenderLoop();
 
@@ -413,6 +424,7 @@ class YgoRemoteLensApp {
     const siftHealth = await this.checkSiftServer();
     if (siftHealth) {
       this.useSiftServer = true;
+      await this.syncCardsFromServer();
       if (this.aiEngineSelect) {
         this.aiEngineSelect.value = 'sift';
         this.aiEngineSelect.disabled = false;
@@ -422,8 +434,9 @@ class YgoRemoteLensApp {
         c.isFallback = false;
       });
       this.renderDBList();
+      const stageLabel = siftHealth.two_stage_bovw ? '・2段階検索' : '';
       this.setStatusBadge(
-        `✅ OpenCV SIFT 稼働中 (${siftHealth.card_count || this.cardsDB.length}枚・Python高精度)`,
+        `✅ OpenCV SIFT 稼働中 (${siftHealth.card_count || this.cardsDB.length}枚・Python高精度${stageLabel})`,
         false
       );
       this.matchStatusText.textContent =
@@ -433,11 +446,46 @@ class YgoRemoteLensApp {
 
     // Pythonサーバー未起動時はブラウザ内AIモードへ自動フォールバック
     this.useSiftServer = false;
+    this.renderDBList();
     if (this.aiEngineSelect && this.aiEngineSelect.value === 'sift') {
       this.aiEngineSelect.value = 'hybrid';
     }
     const preferredEngine = this.aiEngineSelect ? this.aiEngineSelect.value : 'hybrid';
     await this.initBrowserAI(preferredEngine);
+  }
+
+  async syncCardsFromServer() {
+    if (this.siftServerBase === null) return;
+    try {
+      const res = await fetch(`${this.siftServerBase}/api/cards`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data || !Array.isArray(data.cards) || data.cards.length === 0) return;
+
+      const existingMap = new Map(this.cardsDB.map((c) => [c.id, c]));
+      for (const srvCard of data.cards) {
+        const cid = Number(srvCard.id);
+        if (!cid) continue;
+        if (!existingMap.has(cid)) {
+          const entry = {
+            ...srvCard,
+            id: cid,
+            frameType: this.aiEngine.getCardFrameTypeFromMeta(srvCard),
+            safeCanvasElement: null,
+            thumbUrl: srvCard.image_crop,
+            feature: null,
+            centerFeature: null,
+            tightFeature: null,
+            isFallback: false,
+            aiIndexed: true
+          };
+          this.cardsDB.push(entry);
+          existingMap.set(cid, entry);
+        }
+      }
+    } catch (_) {
+      // サーバー同期失敗時は既存のcards_data.jsを使用
+    }
   }
 
   async initBrowserAI(preferredEngine = 'hybrid') {
@@ -729,6 +777,9 @@ class YgoRemoteLensApp {
             false
           );
           if (this.aiEngineSelect) this.aiEngineSelect.value = 'sift';
+          this.renderDBList();
+          this.renderHistory();
+          this.renderPinnedCards();
         } else {
           alert('Python OpenCV SIFT サーバー（http://localhost:8000）が見つかりません。\n./start_server.sh を起動してから選択してください。');
           this.useSiftServer = false;
@@ -1988,9 +2039,10 @@ class YgoRemoteLensApp {
       const { card } = item;
       const box = document.createElement('div');
       box.className = 'pinned-card-box';
+      const cropUrl = this.getCardImageUrl(card, 'crop');
       box.innerHTML = `
         <div class="pinned-card-head">
-          <img src="${this.escapeHtml(card.image_crop)}" alt="${this.escapeHtml(card.name_ja)}" />
+          <img src="${this.escapeHtml(cropUrl)}" alt="${this.escapeHtml(card.name_ja)}" />
           <div class="pinned-card-meta">
             <div class="pinned-card-name">${this.escapeHtml(card.name_ja)}</div>
             <div class="pinned-card-sub">${this.escapeHtml(card.stats_ja)}</div>
@@ -2034,14 +2086,15 @@ class YgoRemoteLensApp {
 
     this.matchBadgeContainer.innerHTML = `<span class="${badgeClass}">${confidenceLabel} 類似度: ${percent}%</span>${engineSuffix}`;
 
-    const imgSrc = card.image_full;
+    const imgSrc = this.getCardImageUrl(card, 'full');
+    const fallbackCropSrc = this.getCardImageUrl(card, 'crop');
     const pinned = this.isCardPinned(card.id);
 
     this.cardDetailContainer.innerHTML = `
       <div class="card-detail">
         <div class="card-top">
           <div class="card-image-box">
-            <img src="${this.escapeHtml(imgSrc)}" alt="${this.escapeHtml(card.name_ja)}" onerror="this.src='${this.escapeHtml(card.image_crop)}'" />
+            <img src="${this.escapeHtml(imgSrc)}" alt="${this.escapeHtml(card.name_ja)}" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${this.escapeHtml(fallbackCropSrc)}';}" />
           </div>
           <div class="card-meta">
             <div class="card-name-ja">${this.escapeHtml(card.name_ja)}</div>
@@ -2078,7 +2131,7 @@ class YgoRemoteLensApp {
       topCandidates.forEach((item, idx) => {
         const shown = item.displayScore !== undefined ? item.displayScore : item.score;
         const p = (Math.max(0, Math.min(1, shown)) * 100).toFixed(1);
-        const thumbSrc = item.card.image_crop;
+        const thumbSrc = this.getCardImageUrl(item.card, 'crop');
 
         const div = document.createElement('div');
         div.className = `candidate-item ${item.card.id === card.id ? 'active' : ''}`;
@@ -2175,8 +2228,9 @@ class YgoRemoteLensApp {
 
         const div = document.createElement('div');
         div.className = `history-item ${isActive ? 'active' : ''}`;
+        const cropUrl = this.getCardImageUrl(item.card, 'crop');
         div.innerHTML = `
-          <img src="${this.escapeHtml(item.card.image_crop)}" alt="${this.escapeHtml(item.card.name_ja)}" />
+          <img src="${this.escapeHtml(cropUrl)}" loading="lazy" alt="${this.escapeHtml(item.card.name_ja)}" />
           <div class="history-meta">
             <div class="history-name-row">
               <div class="history-name" title="${this.escapeHtml(item.card.name_ja)}">${this.escapeHtml(item.card.name_ja)}</div>
@@ -2214,8 +2268,9 @@ class YgoRemoteLensApp {
 
           const chip = document.createElement('div');
           chip.className = `quick-chip ${isActive ? 'active' : ''}`;
+          const cropUrl = this.getCardImageUrl(item.card, 'crop');
           chip.innerHTML = `
-            <img src="${this.escapeHtml(item.card.image_crop)}" alt="${this.escapeHtml(item.card.name_ja)}" />
+            <img src="${this.escapeHtml(cropUrl)}" loading="lazy" alt="${this.escapeHtml(item.card.name_ja)}" />
             <span class="quick-chip-name">${this.escapeHtml(item.card.name_ja)}</span>
             ${countBadge}
             <button class="pin-mini-btn ${isPinned ? 'pinned' : ''}" title="${isPinned ? 'ピン留め解除' : '比較用にピン留め'}">📌</button>
@@ -2239,15 +2294,18 @@ class YgoRemoteLensApp {
   renderDBList() {
     this.dbCount.textContent = this.cardsDB.length;
     this.dbCardList.innerHTML = '';
-    this.cardsDB.forEach((card) => {
+    const MAX_RENDER = 200;
+    const slice = this.cardsDB.slice(0, MAX_RENDER);
+    slice.forEach((card) => {
       const statusIcon = card.aiIndexed && !card.isFallback ? '🤖' : card.isFallback ? '⏳' : '🖼️';
       const div = document.createElement('div');
       div.className = 'history-item';
+      const cropUrl = this.getCardImageUrl(card, 'crop');
       div.innerHTML = `
-        <img src="${card.image_crop}" alt="${card.name_ja}" />
+        <img src="${this.escapeHtml(cropUrl)}" loading="lazy" alt="${this.escapeHtml(card.name_ja)}" />
         <div class="history-meta">
-          <div class="history-name">${statusIcon} ${card.name_ja}</div>
-          <div class="history-sub">${card.name_en} (${card.stats_ja})</div>
+          <div class="history-name">${statusIcon} ${this.escapeHtml(card.name_ja)}</div>
+          <div class="history-sub">${this.escapeHtml(card.name_en)} (${this.escapeHtml(card.stats_ja)})</div>
         </div>
       `;
       div.addEventListener('click', () => {
@@ -2256,6 +2314,12 @@ class YgoRemoteLensApp {
       });
       this.dbCardList.appendChild(div);
     });
+    if (this.cardsDB.length > MAX_RENDER) {
+      const note = document.createElement('div');
+      note.style.cssText = 'font-size:0.75rem;color:var(--text-sub);text-align:center;padding:8px;';
+      note.textContent = `※表示負荷軽減のため先頭 ${MAX_RENDER} 件を表示中（全 ${this.cardsDB.length} 枚が認識対象です）`;
+      this.dbCardList.appendChild(note);
+    }
   }
 
   async addCardFromApi() {
